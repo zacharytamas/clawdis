@@ -48,6 +48,28 @@ export async function buildProviderSummary(
     );
   }
 
+  const mattermostEnabled = effective.mattermost?.enabled !== false;
+  if (!mattermostEnabled) {
+    lines.push(chalk.cyan("Mattermost: disabled"));
+  } else {
+    const baseUrl =
+      process.env.MATTERMOST_URL ?? effective.mattermost?.baseUrl;
+    const token =
+      process.env.MATTERMOST_TOKEN ?? effective.mattermost?.token;
+    const host = (() => {
+      if (!baseUrl) return "";
+      try {
+        return new URL(baseUrl).host;
+      } catch {
+        return "";
+      }
+    })();
+    const label = host ? `Mattermost: configured (${host})` : "Mattermost: configured";
+    lines.push(
+      baseUrl && token ? chalk.green(label) : chalk.cyan("Mattermost: not configured"),
+    );
+  }
+
   const allowFrom = effective.routing?.allowFrom?.length
     ? effective.routing.allowFrom.map(normalizeE164).filter(Boolean)
     : [];

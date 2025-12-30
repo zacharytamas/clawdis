@@ -82,6 +82,32 @@ export async function sendCommand(
     return;
   }
 
+  if (provider === "mattermost") {
+    const result = await deps.sendMessageMattermost(opts.to, opts.message);
+    runtime.log(
+      success(
+        `✅ Sent via mattermost. Post ID: ${result.postId} (channel ${result.channelId})`,
+      ),
+    );
+    if (opts.json) {
+      runtime.log(
+        JSON.stringify(
+          {
+            provider: "mattermost",
+            via: "direct",
+            to: opts.to,
+            channelId: result.channelId,
+            postId: result.postId,
+            mediaUrl: opts.media ?? null,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    return;
+  }
+
   // Always send via gateway over WS to avoid multi-session corruption.
   const sendViaGateway = async () =>
     callGateway<{

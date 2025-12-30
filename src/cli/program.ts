@@ -149,10 +149,12 @@ export function buildProgram() {
 
   program
     .command("send")
-    .description("Send a message (WhatsApp Web, Telegram bot, or Discord)")
+    .description(
+      "Send a message (WhatsApp Web, Telegram bot, Discord, or Mattermost)",
+    )
     .requiredOption(
       "-t, --to <number>",
-      "Recipient: E.164 for WhatsApp, Telegram chat id/@username, or Discord channel/user",
+      "Recipient: E.164 for WhatsApp, Telegram chat id/@username, Discord channel/user, or Mattermost user/channel",
     )
     .requiredOption("-m, --message <text>", "Message body")
     .option(
@@ -161,7 +163,7 @@ export function buildProgram() {
     )
     .option(
       "--provider <provider>",
-      "Delivery provider: whatsapp|telegram|discord (default: whatsapp)",
+      "Delivery provider: whatsapp|telegram|discord|mattermost (default: whatsapp)",
     )
     .option("--dry-run", "Print payload and skip sending", false)
     .option("--json", "Output result as JSON", false)
@@ -189,7 +191,7 @@ Examples:
   program
     .command("agent")
     .description(
-      "Talk directly to the configured agent (no chat send; optional WhatsApp delivery)",
+      "Talk directly to the configured agent (no chat send; optional delivery)",
     )
     .requiredOption("-m, --message <text>", "Message body for the agent")
     .option(
@@ -204,7 +206,7 @@ Examples:
     .option("--verbose <on|off>", "Persist agent verbose level for the session")
     .option(
       "--provider <provider>",
-      "Delivery provider: whatsapp|telegram|discord (default: whatsapp)",
+      "Delivery provider: whatsapp|telegram|discord|mattermost (default: whatsapp)",
     )
     .option(
       "--deliver",

@@ -415,6 +415,7 @@ export async function agentCommand(
   const whatsappTarget = opts.to ? normalizeE164(opts.to) : allowFrom[0];
   const telegramTarget = opts.to?.trim() || undefined;
   const discordTarget = opts.to?.trim() || undefined;
+  const mattermostTarget = opts.to?.trim() || undefined;
 
   const logDeliveryError = (err: unknown) => {
     const deliveryTarget =
@@ -424,6 +425,8 @@ export async function agentCommand(
           ? whatsappTarget
           : deliveryProvider === "discord"
             ? discordTarget
+            : deliveryProvider === "mattermost"
+              ? mattermostTarget
             : undefined;
     const message = `Delivery failed (${deliveryProvider}${deliveryTarget ? ` to ${deliveryTarget}` : ""}): ${String(err)}`;
     runtime.error?.(message);
@@ -450,6 +453,13 @@ export async function agentCommand(
       if (!bestEffortDeliver) throw err;
       logDeliveryError(err);
     }
+    if (deliveryProvider === "mattermost" && !mattermostTarget) {
+      const err = new Error(
+        "Delivering to Mattermost requires --to <user:ID|@username|channel:ID>",
+      );
+      if (!bestEffortDeliver) throw err;
+      logDeliveryError(err);
+    }
     if (deliveryProvider === "webchat") {
       const err = new Error(
         "Delivering to WebChat is not supported via `clawdis agent`; use WhatsApp/Telegram or run with --deliver=false.",
@@ -461,6 +471,7 @@ export async function agentCommand(
       deliveryProvider !== "whatsapp" &&
       deliveryProvider !== "telegram" &&
       deliveryProvider !== "discord" &&
+      deliveryProvider !== "mattermost" &&
       deliveryProvider !== "webchat"
     ) {
       const err = new Error(`Unknown provider: ${deliveryProvider}`);
@@ -568,6 +579,24 @@ export async function agentCommand(
               mediaUrl: url,
             });
           }
+        }
+      } catch (err) {
+        if (!bestEffortDeliver) throw err;
+        logDeliveryError(err);
+      }
+    }
+
+    if (deliveryProvider === "mattermost" && mattermostTarget) {
+      try {
+        if (media.length > 0 && !text) {
+          await deps.sendMessageMattermost(
+            mattermostTarget,
+            "Media omitted (Mattermost uploads not configured).",
+          );
+          continue;
+        }
+        if (text) {
+          await deps.sendMessageMattermost(mattermostTarget, text);
         }
       } catch (err) {
         if (!bestEffortDeliver) throw err;

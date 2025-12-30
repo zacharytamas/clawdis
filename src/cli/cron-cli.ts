@@ -155,7 +155,7 @@ export function registerCronCli(program: Command) {
       .option("--deliver", "Deliver agent output", false)
       .option(
         "--channel <channel>",
-        "Delivery channel (last|whatsapp|telegram|discord)",
+        "Delivery channel (last|whatsapp|telegram|discord|mattermost)",
         "last",
       )
       .option(
@@ -414,7 +414,7 @@ export function registerCronCli(program: Command) {
       .option("--deliver", "Deliver agent output", false)
       .option(
         "--channel <channel>",
-        "Delivery channel (last|whatsapp|telegram|discord)",
+        "Delivery channel (last|whatsapp|telegram|discord|mattermost)",
       )
       .option(
         "--to <dest>",

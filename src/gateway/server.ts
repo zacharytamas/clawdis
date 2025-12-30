@@ -74,6 +74,10 @@ import {
   sendMessageDiscord,
 } from "../discord/index.js";
 import { type DiscordProbe, probeDiscord } from "../discord/probe.js";
+import {
+  monitorMattermostProvider,
+  sendMessageMattermost,
+} from "../mattermost/index.js";
 import { isVerbose } from "../globals.js";
 import { onAgentEvent } from "../infra/agent-events.js";
 import { startGatewayBonjourAdvertiser } from "../infra/bonjour.js";
@@ -283,10 +287,12 @@ const logWsControl = log.child("ws");
 const logWhatsApp = logProviders.child("whatsapp");
 const logTelegram = logProviders.child("telegram");
 const logDiscord = logProviders.child("discord");
+const logMattermost = logProviders.child("mattermost");
 const canvasRuntime = runtimeForLogger(logCanvas);
 const whatsappRuntimeEnv = runtimeForLogger(logWhatsApp);
 const telegramRuntimeEnv = runtimeForLogger(logTelegram);
 const discordRuntimeEnv = runtimeForLogger(logDiscord);
+const mattermostRuntimeEnv = runtimeForLogger(logMattermost);
 
 function loadTelegramToken(
   config: ClawdisConfig,
@@ -1367,7 +1373,7 @@ export async function startGatewayServer(
           wakeMode: "now" | "next-heartbeat";
           sessionKey: string;
           deliver: boolean;
-          channel: "last" | "whatsapp" | "telegram" | "discord";
+          channel: "last" | "whatsapp" | "telegram" | "discord" | "mattermost";
           to?: string;
           thinking?: string;
           timeoutSeconds?: number;
@@ -1392,6 +1398,7 @@ export async function startGatewayServer(
       channelRaw === "whatsapp" ||
       channelRaw === "telegram" ||
       channelRaw === "discord" ||
+      channelRaw === "mattermost" ||
       channelRaw === "last"
         ? channelRaw
         : channelRaw === undefined
@@ -1400,7 +1407,7 @@ export async function startGatewayServer(
     if (channel === null) {
       return {
         ok: false,
-        error: "channel must be last|whatsapp|telegram|discord",
+        error: "channel must be last|whatsapp|telegram|discord|mattermost",
       };
     }
     const toRaw = payload.to;
@@ -1451,7 +1458,7 @@ export async function startGatewayServer(
     wakeMode: "now" | "next-heartbeat";
     sessionKey: string;
     deliver: boolean;
-    channel: "last" | "whatsapp" | "telegram" | "discord";
+    channel: "last" | "whatsapp" | "telegram" | "discord" | "mattermost";
     to?: string;
     thinking?: string;
     timeoutSeconds?: number;
@@ -1734,9 +1741,11 @@ export async function startGatewayServer(
   let whatsappAbort: AbortController | null = null;
   let telegramAbort: AbortController | null = null;
   let discordAbort: AbortController | null = null;
+  let mattermostAbort: AbortController | null = null;
   let whatsappTask: Promise<unknown> | null = null;
   let telegramTask: Promise<unknown> | null = null;
   let discordTask: Promise<unknown> | null = null;
+  let mattermostTask: Promise<unknown> | null = null;
   let whatsappRuntime: WebProviderStatus = {
     running: false,
     connected: false,
@@ -1761,6 +1770,17 @@ export async function startGatewayServer(
     mode: null,
   };
   let discordRuntime: {
+    running: boolean;
+    lastStartAt?: number | null;
+    lastStopAt?: number | null;
+    lastError?: string | null;
+  } = {
+    running: false,
+    lastStartAt: null,
+    lastStopAt: null,
+    lastError: null,
+  };
+  let mattermostRuntime: {
     running: boolean;
     lastStartAt?: number | null;
     lastStopAt?: number | null;
@@ -2102,10 +2122,97 @@ export async function startGatewayServer(
     };
   };
 
+  const startMattermostProvider = async () => {
+    if (mattermostTask) return;
+    const cfg = loadConfig();
+    if (cfg.mattermost?.enabled === false) {
+      mattermostRuntime = {
+        ...mattermostRuntime,
+        running: false,
+        lastError: "disabled",
+      };
+      logMattermost.info("skipping provider start (mattermost.enabled=false)");
+      return;
+    }
+    const baseUrl =
+      process.env.MATTERMOST_URL ?? cfg.mattermost?.baseUrl ?? "";
+    const token =
+      process.env.MATTERMOST_TOKEN ?? cfg.mattermost?.token ?? "";
+    if (!baseUrl.trim() || !token.trim()) {
+      mattermostRuntime = {
+        ...mattermostRuntime,
+        running: false,
+        lastError: "not configured",
+      };
+      logMattermost.info(
+        "skipping provider start (no MATTERMOST_URL/TOKEN/config)",
+      );
+      return;
+    }
+    let hostLabel = "";
+    try {
+      hostLabel = ` (${new URL(baseUrl).host})`;
+    } catch {
+      hostLabel = "";
+    }
+    logMattermost.info(`starting provider${hostLabel}`);
+    mattermostAbort = new AbortController();
+    mattermostRuntime = {
+      ...mattermostRuntime,
+      running: true,
+      lastStartAt: Date.now(),
+      lastError: null,
+    };
+    const task = monitorMattermostProvider({
+      baseUrl: baseUrl.trim(),
+      token: token.trim(),
+      wsUrl: cfg.mattermost?.wsUrl ?? process.env.MATTERMOST_WS_URL,
+      runtime: mattermostRuntimeEnv,
+      abortSignal: mattermostAbort.signal,
+      requireMention: cfg.mattermost?.requireMention,
+      allowFrom: cfg.mattermost?.allowFrom,
+    })
+      .catch((err) => {
+        mattermostRuntime = {
+          ...mattermostRuntime,
+          lastError: formatError(err),
+        };
+        logMattermost.error(`provider exited: ${formatError(err)}`);
+      })
+      .finally(() => {
+        mattermostAbort = null;
+        mattermostTask = null;
+        mattermostRuntime = {
+          ...mattermostRuntime,
+          running: false,
+          lastStopAt: Date.now(),
+        };
+      });
+    mattermostTask = task;
+  };
+
+  const stopMattermostProvider = async () => {
+    if (!mattermostAbort && !mattermostTask) return;
+    mattermostAbort?.abort();
+    try {
+      await mattermostTask;
+    } catch {
+      // ignore
+    }
+    mattermostAbort = null;
+    mattermostTask = null;
+    mattermostRuntime = {
+      ...mattermostRuntime,
+      running: false,
+      lastStopAt: Date.now(),
+    };
+  };
+
   const startProviders = async () => {
     await startWhatsAppProvider();
     await startDiscordProvider();
     await startTelegramProvider();
+    await startMattermostProvider();
   };
 
   const broadcast = (
@@ -3984,6 +4091,28 @@ export async function startGatewayServer(
                 discordLastProbeAt = Date.now();
               }
 
+              const mattermostEnvUrl =
+                process.env.MATTERMOST_URL?.trim() ?? "";
+              const mattermostConfigUrl =
+                cfg.mattermost?.baseUrl?.trim() ?? "";
+              const mattermostEnvToken =
+                process.env.MATTERMOST_TOKEN?.trim() ?? "";
+              const mattermostConfigToken =
+                cfg.mattermost?.token?.trim() ?? "";
+              const mattermostUrl = mattermostEnvUrl || mattermostConfigUrl;
+              const mattermostToken =
+                mattermostEnvToken || mattermostConfigToken;
+              const mattermostUrlSource = mattermostEnvUrl
+                ? "env"
+                : mattermostConfigUrl
+                  ? "config"
+                  : "none";
+              const mattermostTokenSource = mattermostEnvToken
+                ? "env"
+                : mattermostConfigToken
+                  ? "config"
+                  : "none";
+
               const linked = await webAuthExists();
               const authAgeMs = getWebAuthAgeMs();
               const self = readWebSelfId();
@@ -4026,6 +4155,15 @@ export async function startGatewayServer(
                     lastError: discordRuntime.lastError ?? null,
                     probe: discordProbe,
                     lastProbeAt: discordLastProbeAt,
+                  },
+                  mattermost: {
+                    configured: Boolean(mattermostUrl && mattermostToken),
+                    urlSource: mattermostUrlSource,
+                    tokenSource: mattermostTokenSource,
+                    running: mattermostRuntime.running,
+                    lastStartAt: mattermostRuntime.lastStartAt ?? null,
+                    lastStopAt: mattermostRuntime.lastStopAt ?? null,
+                    lastError: mattermostRuntime.lastError ?? null,
                   },
                 },
                 undefined,
@@ -5925,6 +6063,20 @@ export async function startGatewayServer(
                     payload,
                   });
                   respond(true, payload, undefined, { provider });
+                } else if (provider === "mattermost") {
+                  const result = await sendMessageMattermost(to, message);
+                  const payload = {
+                    runId: idem,
+                    postId: result.postId,
+                    channelId: result.channelId,
+                    provider,
+                  };
+                  dedupe.set(`send:${idem}`, {
+                    ts: Date.now(),
+                    ok: true,
+                    payload,
+                  });
+                  respond(true, payload, undefined, { provider });
                 } else {
                   const result = await sendMessageWhatsApp(to, message, {
                     mediaUrl: params.mediaUrl,
@@ -6061,6 +6213,7 @@ export async function startGatewayServer(
                   requestedChannel === "whatsapp" ||
                   requestedChannel === "telegram" ||
                   requestedChannel === "discord" ||
+                  requestedChannel === "mattermost" ||
                   requestedChannel === "webchat"
                 ) {
                   return requestedChannel;
@@ -6079,7 +6232,8 @@ export async function startGatewayServer(
                 if (
                   resolvedChannel === "whatsapp" ||
                   resolvedChannel === "telegram" ||
-                  resolvedChannel === "discord"
+                  resolvedChannel === "discord" ||
+                  resolvedChannel === "mattermost"
                 ) {
                   return lastTo || undefined;
                 }
@@ -6268,7 +6422,7 @@ export async function startGatewayServer(
     logBrowser.error(`server failed to start: ${String(err)}`);
   }
 
-  // Launch configured providers (WhatsApp Web, Discord, Telegram) so gateway replies via the
+  // Launch configured providers (WhatsApp Web, Discord, Telegram, Mattermost) so gateway replies via the
   // surface the message came from. Tests can opt out via CLAWDIS_SKIP_PROVIDERS.
   if (process.env.CLAWDIS_SKIP_PROVIDERS !== "1") {
     try {
@@ -6324,6 +6478,7 @@ export async function startGatewayServer(
       await stopWhatsAppProvider();
       await stopTelegramProvider();
       await stopDiscordProvider();
+      await stopMattermostProvider();
       cron.stop();
       heartbeatRunner.stop();
       broadcast("shutdown", {
@@ -6361,7 +6516,9 @@ export async function startGatewayServer(
         await stopBrowserControlServerIfStarted().catch(() => {});
       }
       await Promise.allSettled(
-        [whatsappTask, telegramTask].filter(Boolean) as Array<Promise<unknown>>,
+        [whatsappTask, telegramTask, mattermostTask].filter(
+          Boolean,
+        ) as Array<Promise<unknown>>,
       );
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       await new Promise<void>((resolve, reject) =>

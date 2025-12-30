@@ -96,7 +96,7 @@ export type HookMappingConfig = {
   messageTemplate?: string;
   textTemplate?: string;
   deliver?: boolean;
-  channel?: "last" | "whatsapp" | "telegram" | "discord";
+  channel?: "last" | "whatsapp" | "telegram" | "discord" | "mattermost";
   to?: string;
   thinking?: string;
   timeoutSeconds?: number;
@@ -165,6 +165,17 @@ export type DiscordConfig = {
   mediaMaxMb?: number;
 };
 
+export type MattermostConfig = {
+  /** If false, do not start the Mattermost provider. Default: true. */
+  enabled?: boolean;
+  baseUrl?: string;
+  token?: string;
+  wsUrl?: string;
+  requireMention?: boolean;
+  allowFrom?: Array<string | number>;
+  mediaMaxMb?: number;
+};
+
 export type QueueMode = "queue" | "interrupt";
 
 export type QueueModeBySurface = {
@@ -172,6 +183,7 @@ export type QueueModeBySurface = {
   telegram?: QueueMode;
   discord?: QueueMode;
   webchat?: QueueMode;
+  mattermost?: QueueMode;
 };
 
 export type GroupChatConfig = {
@@ -399,8 +411,8 @@ export type ClawdisConfig = {
       every?: string;
       /** Heartbeat model override (provider/model). */
       model?: string;
-      /** Delivery target (last|whatsapp|telegram|discord|none). */
-      target?: "last" | "whatsapp" | "telegram" | "discord" | "none";
+      /** Delivery target (last|whatsapp|telegram|discord|mattermost|none). */
+      target?: "last" | "whatsapp" | "telegram" | "discord" | "mattermost" | "none";
       /** Optional delivery override (E.164 for WhatsApp, chat id for Telegram). */
       to?: string;
       /** Override the heartbeat prompt body (default: "HEARTBEAT"). */
@@ -424,6 +436,7 @@ export type ClawdisConfig = {
   web?: WebConfig;
   telegram?: TelegramConfig;
   discord?: DiscordConfig;
+  mattermost?: MattermostConfig;
   cron?: CronConfig;
   hooks?: HooksConfig;
   bridge?: BridgeConfig;
@@ -431,7 +444,6 @@ export type ClawdisConfig = {
   canvasHost?: CanvasHostConfig;
   talk?: TalkConfig;
   gateway?: GatewayConfig;
-  skills?: SkillsConfig;
 };
 
 /**
@@ -519,6 +531,7 @@ const QueueModeBySurfaceSchema = z
     telegram: QueueModeSchema.optional(),
     discord: QueueModeSchema.optional(),
     webchat: QueueModeSchema.optional(),
+    mattermost: QueueModeSchema.optional(),
   })
   .optional();
 
@@ -563,6 +576,7 @@ const HeartbeatSchema = z
         z.literal("whatsapp"),
         z.literal("telegram"),
         z.literal("discord"),
+        z.literal("mattermost"),
         z.literal("none"),
       ])
       .optional(),
@@ -621,6 +635,7 @@ const HookMappingSchema = z
         z.literal("whatsapp"),
         z.literal("telegram"),
         z.literal("discord"),
+        z.literal("mattermost"),
       ])
       .optional(),
     to: z.string().optional(),
@@ -811,6 +826,17 @@ const ClawdisSchema = z.object({
         })
         .optional(),
       requireMention: z.boolean().optional(),
+      mediaMaxMb: z.number().positive().optional(),
+    })
+    .optional(),
+  mattermost: z
+    .object({
+      enabled: z.boolean().optional(),
+      baseUrl: z.string().optional(),
+      token: z.string().optional(),
+      wsUrl: z.string().optional(),
+      requireMention: z.boolean().optional(),
+      allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
       mediaMaxMb: z.number().positive().optional(),
     })
     .optional(),

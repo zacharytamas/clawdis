@@ -35,6 +35,7 @@ const makeDeps = (overrides: Partial<CliDeps> = {}): CliDeps => ({
   sendMessageWhatsApp: vi.fn(),
   sendMessageTelegram: vi.fn(),
   sendMessageDiscord: vi.fn(),
+  sendMessageMattermost: vi.fn(),
   ...overrides,
 });
 

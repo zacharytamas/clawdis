@@ -53,7 +53,7 @@ function pickSummaryFromPayloads(
 function resolveDeliveryTarget(
   cfg: ClawdisConfig,
   jobPayload: {
-    channel?: "last" | "whatsapp" | "telegram" | "discord";
+    channel?: "last" | "whatsapp" | "telegram" | "discord" | "mattermost";
     to?: string;
   },
 ) {
@@ -79,7 +79,8 @@ function resolveDeliveryTarget(
     if (
       requestedChannel === "whatsapp" ||
       requestedChannel === "telegram" ||
-      requestedChannel === "discord"
+      requestedChannel === "discord" ||
+      requestedChannel === "mattermost"
     ) {
       return requestedChannel;
     }
@@ -408,6 +409,37 @@ export async function runCronIsolatedAgentTurn(params: {
               });
             }
           }
+        }
+      } catch (err) {
+        if (!bestEffortDeliver)
+          return { status: "error", summary, error: String(err) };
+        return { status: "ok", summary };
+      }
+    } else if (resolvedDelivery.channel === "mattermost") {
+      if (!resolvedDelivery.to) {
+        if (!bestEffortDeliver)
+          return {
+            status: "error",
+            summary,
+            error:
+              "Cron delivery to Mattermost requires --channel mattermost and --to <user:ID|@username|channel:ID>",
+          };
+        return {
+          status: "skipped",
+          summary: "Delivery skipped (no Mattermost destination).",
+        };
+      }
+      const target = resolvedDelivery.to;
+      try {
+        for (const payload of payloads) {
+          const mediaList =
+            payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
+          let text = payload.text ?? "";
+          if (!text && mediaList.length > 0) {
+            text = "Media omitted (Mattermost uploads not configured).";
+          }
+          if (!text.trim()) continue;
+          await params.deps.sendMessageMattermost(target, text);
         }
       } catch (err) {
         if (!bestEffortDeliver)

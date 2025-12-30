@@ -966,6 +966,7 @@ export async function getReplyFromConfig(
           if (surface === "telegram") return "Telegram";
           if (surface === "discord") return "Discord";
           if (surface === "webchat") return "WebChat";
+          if (surface === "mattermost") return "Mattermost";
           return `${surface.at(0)?.toUpperCase() ?? ""}${surface.slice(1)}`;
         })();
         const subjectLine = subject
