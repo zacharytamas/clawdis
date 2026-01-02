@@ -1246,7 +1246,9 @@ const LEGACY_CONFIG_MIGRATIONS: LegacyConfigMigration[] = [
         whatsapp.allowFrom = allowFrom;
         changes.push("Moved routing.allowFrom → whatsapp.allowFrom.");
       } else {
-        changes.push("Removed routing.allowFrom (whatsapp.allowFrom already set).");
+        changes.push(
+          "Removed routing.allowFrom (whatsapp.allowFrom already set).",
+        );
       }
 
       delete (routing as Record<string, unknown>).allowFrom;

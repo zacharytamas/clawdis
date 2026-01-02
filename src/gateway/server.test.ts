@@ -134,7 +134,7 @@ let testLegacyIssues: Array<{ path: string; message: string }> = [];
 let testLegacyParsed: Record<string, unknown> = {};
 let testMigrationConfig: Record<string, unknown> | null = null;
 let testMigrationChanges: string[] = [];
-let testIsNixMode = false;
+const testIsNixMode = vi.hoisted(() => ({ value: false }));
 const sessionStoreSaveDelayMs = vi.hoisted(() => ({ value: 0 }));
 vi.mock("../config/sessions.js", async () => {
   const actual = await vi.importActual<typeof import("../config/sessions.js")>(
@@ -223,7 +223,9 @@ vi.mock("../config/config.js", () => {
   return {
     CONFIG_PATH_CLAWDIS: resolveConfigPath(),
     STATE_DIR_CLAWDIS: path.dirname(resolveConfigPath()),
-    isNixMode: testIsNixMode,
+    get isNixMode() {
+      return testIsNixMode.value;
+    },
     migrateLegacyConfig: (raw: unknown) => ({
       config: testMigrationConfig ?? (raw as Record<string, unknown>),
       changes: testMigrationChanges,
@@ -310,7 +312,7 @@ beforeEach(async () => {
   testLegacyParsed = {};
   testMigrationConfig = null;
   testMigrationChanges = [];
-  testIsNixMode = false;
+  testIsNixMode.value = false;
   cronIsolatedRun.mockClear();
   drainSystemEvents();
   resetAgentRunContextForTest();
@@ -574,7 +576,7 @@ describe("gateway server", () => {
       },
     ];
     testLegacyParsed = { routing: { allowFrom: ["+15555550123"] } };
-    testIsNixMode = true;
+    testIsNixMode.value = true;
 
     const port = await getFreePort();
     await expect(startGatewayServer(port)).rejects.toThrow(
@@ -941,6 +943,53 @@ describe("gateway server", () => {
             command: "canvas.eval",
             paramsJSON: JSON.stringify({ javaScript: "2+2" }),
             timeoutMs: 123,
+          }),
+        );
+      } finally {
+        ws.close();
+        await server.close();
+      }
+    } finally {
+      await fs.rm(homeDir, { recursive: true, force: true });
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+    }
+  });
+
+  test("routes camera.list invoke to the node bridge", async () => {
+    const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-home-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = homeDir;
+
+    try {
+      bridgeInvoke.mockResolvedValueOnce({
+        type: "invoke-res",
+        id: "inv-2",
+        ok: true,
+        payloadJSON: JSON.stringify({ devices: [] }),
+        error: null,
+      });
+
+      const { server, ws } = await startServerWithClient();
+      try {
+        await connectOk(ws);
+
+        const res = await rpcReq(ws, "node.invoke", {
+          nodeId: "ios-node",
+          command: "camera.list",
+          params: {},
+          idempotencyKey: "idem-2",
+        });
+        expect(res.ok).toBe(true);
+
+        expect(bridgeInvoke).toHaveBeenCalledWith(
+          expect.objectContaining({
+            nodeId: "ios-node",
+            command: "camera.list",
+            paramsJSON: JSON.stringify({}),
           }),
         );
       } finally {

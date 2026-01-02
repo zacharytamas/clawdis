@@ -17,6 +17,26 @@ enum GatewayLaunchAgentManager {
         "\(bundlePath)/Contents/Resources/Relay"
     }
 
+    private static func gatewayProgramArguments(bundlePath: String, port: Int, bind: String) -> [String] {
+#if DEBUG
+        let projectRoot = CommandResolver.projectRoot()
+        if let localBin = CommandResolver.projectClawdisExecutable(projectRoot: projectRoot) {
+            return [localBin, "gateway", "--port", "\(port)", "--bind", bind]
+        }
+        if let entry = CommandResolver.gatewayEntrypoint(in: projectRoot),
+           case let .success(runtime) = CommandResolver.runtimeResolution()
+        {
+            return CommandResolver.makeRuntimeCommand(
+                runtime: runtime,
+                entrypoint: entry,
+                subcommand: "gateway",
+                extraArgs: ["--port", "\(port)", "--bind", bind])
+        }
+#endif
+        let gatewayBin = self.gatewayExecutablePath(bundlePath: bundlePath)
+        return [gatewayBin, "gateway-daemon", "--port", "\(port)", "--bind", bind]
+    }
+
     static func status() async -> Bool {
         guard FileManager.default.fileExists(atPath: self.plistURL.path) else { return false }
         let result = await self.runLaunchctl(["print", "gui/\(getuid())/\(gatewayLaunchdLabel)"])
@@ -58,12 +78,13 @@ enum GatewayLaunchAgentManager {
     }
 
     private static func writePlist(bundlePath: String, port: Int) {
-        let gatewayBin = self.gatewayExecutablePath(bundlePath: bundlePath)
         let relayDir = self.relayDir(bundlePath: bundlePath)
         let preferredPath = ([relayDir] + CommandResolver.preferredPaths())
             .joined(separator: ":")
         let bind = self.preferredGatewayBind() ?? "loopback"
+        let programArguments = self.gatewayProgramArguments(bundlePath: bundlePath, port: port, bind: bind)
         let token = self.preferredGatewayToken()
+        let password = self.preferredGatewayPassword()
         var envEntries = """
             <key>PATH</key>
             <string>\(preferredPath)</string>
@@ -71,11 +92,22 @@ enum GatewayLaunchAgentManager {
             <string>sips</string>
         """
         if let token {
+            let escapedToken = self.escapePlistValue(token)
             envEntries += """
                 <key>CLAWDIS_GATEWAY_TOKEN</key>
-                <string>\(token)</string>
+                <string>\(escapedToken)</string>
             """
         }
+        if let password {
+            let escapedPassword = self.escapePlistValue(password)
+            envEntries += """
+                <key>CLAWDIS_GATEWAY_PASSWORD</key>
+                <string>\(escapedPassword)</string>
+            """
+        }
+        let argsXml = programArguments
+            .map { "<string>\(self.escapePlistValue($0))</string>" }
+            .joined(separator: "\n            ")
         let plist = """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -85,12 +117,7 @@ enum GatewayLaunchAgentManager {
           <string>\(gatewayLaunchdLabel)</string>
           <key>ProgramArguments</key>
           <array>
-            <string>\(gatewayBin)</string>
-            <string>gateway-daemon</string>
-            <string>--port</string>
-            <string>\(port)</string>
-            <string>--bind</string>
-            <string>\(bind)</string>
+            \(argsXml)
           </array>
           <key>WorkingDirectory</key>
           <string>\(FileManager.default.homeDirectoryForCurrentUser.path)</string>
@@ -146,6 +173,33 @@ enum GatewayLaunchAgentManager {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    private static func preferredGatewayPassword() -> String? {
+        // First check environment variable
+        let raw = ProcessInfo.processInfo.environment["CLAWDIS_GATEWAY_PASSWORD"] ?? ""
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+        // Then check config file (gateway.auth.password)
+        let root = ClawdisConfigFile.loadDict()
+        if let gateway = root["gateway"] as? [String: Any],
+           let auth = gateway["auth"] as? [String: Any],
+           let password = auth["password"] as? String
+        {
+            return password.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    private static func escapePlistValue(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+    }
+
     private struct LaunchctlResult {
         let status: Int32
         let output: String
@@ -189,6 +243,10 @@ extension GatewayLaunchAgentManager {
 
     static func _testPreferredGatewayToken() -> String? {
         self.preferredGatewayToken()
+    }
+
+    static func _testEscapePlistValue(_ raw: String) -> String {
+        self.escapePlistValue(raw)
     }
 }
 #endif
