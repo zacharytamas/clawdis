@@ -1,0 +1,1 @@
+pnpm clawdis gateway --port 18789
