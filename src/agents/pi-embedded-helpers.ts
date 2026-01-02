@@ -22,8 +22,10 @@ export async function ensureSessionHeader(params: {
     // create
   }
   await fs.mkdir(path.dirname(file), { recursive: true });
+  const sessionVersion = 2;
   const entry = {
     type: "session",
+    version: sessionVersion,
     id: params.sessionId,
     timestamp: new Date().toISOString(),
     cwd: params.cwd,

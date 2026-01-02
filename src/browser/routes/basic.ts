@@ -15,17 +15,25 @@ export function registerBrowserBasicRoutes(
       return jsonError(res, 503, "browser server not started");
     }
 
-    const reachable = await ctx.isReachable(300);
+    const [cdpHttp, cdpReady] = await Promise.all([
+      ctx.isHttpReachable(300),
+      ctx.isReachable(600),
+    ]);
     res.json({
       enabled: current.resolved.enabled,
       controlUrl: current.resolved.controlUrl,
-      running: reachable,
+      running: cdpReady,
+      cdpReady,
+      cdpHttp,
       pid: current.running?.pid ?? null,
       cdpPort: current.cdpPort,
+      cdpUrl: current.resolved.cdpUrl,
       chosenBrowser: current.running?.exe.kind ?? null,
       userDataDir: current.running?.userDataDir ?? null,
       color: current.resolved.color,
       headless: current.resolved.headless,
+      noSandbox: current.resolved.noSandbox,
+      executablePath: current.resolved.executablePath ?? null,
       attachOnly: current.resolved.attachOnly,
     });
   });
@@ -43,6 +51,15 @@ export function registerBrowserBasicRoutes(
     try {
       const result = await ctx.stopRunningBrowser();
       res.json({ ok: true, stopped: result.stopped });
+    } catch (err) {
+      jsonError(res, 500, String(err));
+    }
+  });
+
+  app.post("/reset-profile", async (_req, res) => {
+    try {
+      const result = await ctx.resetProfile();
+      res.json({ ok: true, ...result });
     } catch (err) {
       jsonError(res, 500, String(err));
     }

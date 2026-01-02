@@ -1,3 +1,4 @@
+import chalk from "chalk";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import {
@@ -7,7 +8,6 @@ import {
 } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import chalk from "chalk";
 import { type WebSocket, WebSocketServer } from "ws";
 import { lookupContextTokens } from "../agents/context.js";
 import {
@@ -46,19 +46,20 @@ import { getStatusSummary } from "../commands/status.js";
 import {
   type ClawdisConfig,
   CONFIG_PATH_CLAWDIS,
-  STATE_DIR_CLAWDIS,
   isNixMode,
   loadConfig,
   parseConfigJson5,
   readConfigFileSnapshot,
+  STATE_DIR_CLAWDIS,
   validateConfigObject,
   writeConfigFile,
 } from "../config/config.js";
 import {
+  buildGroupDisplayName,
   loadSessionStore,
   resolveStorePath,
-  type SessionEntry,
   saveSessionStore,
+  type SessionEntry,
 } from "../config/sessions.js";
 import { runCronIsolatedAgentTurn } from "../cron/isolated-agent.js";
 import {
@@ -74,12 +75,18 @@ import {
   sendMessageDiscord,
 } from "../discord/index.js";
 import { type DiscordProbe, probeDiscord } from "../discord/probe.js";
-import {
-  monitorMattermostProvider,
-  sendMessageMattermost,
-} from "../mattermost/index.js";
 import { isVerbose } from "../globals.js";
-import { onAgentEvent } from "../infra/agent-events.js";
+import {
+  monitorIMessageProvider,
+  sendMessageIMessage,
+} from "../imessage/index.js";
+import { type IMessageProbe, probeIMessage } from "../imessage/probe.js";
+import {
+  clearAgentRunContext,
+  getAgentRunContext,
+  onAgentEvent,
+  registerAgentRunContext,
+} from "../infra/agent-events.js";
 import { startGatewayBonjourAdvertiser } from "../infra/bonjour.js";
 import { startNodeBridgeServer } from "../infra/bridge/server.js";
 import { resolveCanvasHostUrl } from "../infra/canvas-host-url.js";
@@ -139,13 +146,20 @@ import {
   getResolvedLoggerSettings,
   runtimeForLogger,
 } from "../logging.js";
+import {
+  monitorMattermostProvider,
+  sendMessageMattermost,
+} from "../mattermost/index.js";
 import { setCommandLaneConcurrency } from "../process/command-queue.js";
 import { runExec } from "../process/exec.js";
 import { monitorWebProvider, webAuthExists } from "../providers/web/index.js";
 import { defaultRuntime } from "../runtime.js";
+import { monitorSignalProvider, sendMessageSignal } from "../signal/index.js";
+import { probeSignal, type SignalProbe } from "../signal/probe.js";
 import { monitorTelegramProvider } from "../telegram/monitor.js";
 import { probeTelegram, type TelegramProbe } from "../telegram/probe.js";
 import { sendMessageTelegram } from "../telegram/send.js";
+import { resolveTelegramToken } from "../telegram/token.js";
 import { normalizeE164, resolveUserPath } from "../utils.js";
 import type { WebProviderStatus } from "../web/auto-reply.js";
 import { startWebLoginWithQr, waitForWebLogin } from "../web/login-qr.js";
@@ -288,11 +302,15 @@ const logWhatsApp = logProviders.child("whatsapp");
 const logTelegram = logProviders.child("telegram");
 const logDiscord = logProviders.child("discord");
 const logMattermost = logProviders.child("mattermost");
+const logSignal = logProviders.child("signal");
+const logIMessage = logProviders.child("imessage");
 const canvasRuntime = runtimeForLogger(logCanvas);
 const whatsappRuntimeEnv = runtimeForLogger(logWhatsApp);
 const telegramRuntimeEnv = runtimeForLogger(logTelegram);
 const discordRuntimeEnv = runtimeForLogger(logDiscord);
 const mattermostRuntimeEnv = runtimeForLogger(logMattermost);
+const signalRuntimeEnv = runtimeForLogger(logSignal);
+const imessageRuntimeEnv = runtimeForLogger(logIMessage);
 
 function loadTelegramToken(
   config: ClawdisConfig,
@@ -471,6 +489,11 @@ type GatewaySessionsDefaults = {
 type GatewaySessionRow = {
   key: string;
   kind: "direct" | "group" | "global" | "unknown";
+  displayName?: string;
+  surface?: string;
+  subject?: string;
+  room?: string;
+  space?: string;
   updatedAt: number | null;
   sessionId?: string;
   systemSent?: boolean;
@@ -878,11 +901,39 @@ function loadSessionEntry(sessionKey: string) {
   return { cfg, storePath, store, entry };
 }
 
-function classifySessionKey(key: string): GatewaySessionRow["kind"] {
+function classifySessionKey(
+  key: string,
+  entry?: SessionEntry,
+): GatewaySessionRow["kind"] {
   if (key === "global") return "global";
-  if (key.startsWith("group:")) return "group";
   if (key === "unknown") return "unknown";
+  if (entry?.chatType === "group" || entry?.chatType === "room") return "group";
+  if (
+    key.startsWith("group:") ||
+    key.includes(":group:") ||
+    key.includes(":channel:")
+  ) {
+    return "group";
+  }
   return "direct";
+}
+
+function parseGroupKey(
+  key: string,
+): { surface?: string; kind?: "group" | "channel"; id?: string } | null {
+  if (key.startsWith("group:")) {
+    const raw = key.slice("group:".length);
+    return raw ? { id: raw } : null;
+  }
+  const parts = key.split(":").filter(Boolean);
+  if (parts.length >= 3) {
+    const [surface, kind, ...rest] = parts;
+    if (kind === "group" || kind === "channel") {
+      const id = rest.join(":");
+      return { surface, kind, id };
+    }
+  }
+  return null;
 }
 
 function getSessionDefaults(cfg: ClawdisConfig): GatewaySessionsDefaults {
@@ -929,9 +980,32 @@ function listSessionsFromStore(params: {
       const input = entry?.inputTokens ?? 0;
       const output = entry?.outputTokens ?? 0;
       const total = entry?.totalTokens ?? input + output;
+      const parsed = parseGroupKey(key);
+      const surface = entry?.surface ?? parsed?.surface;
+      const subject = entry?.subject;
+      const room = entry?.room;
+      const space = entry?.space;
+      const id = parsed?.id;
+      const displayName =
+        entry?.displayName ??
+        (surface
+          ? buildGroupDisplayName({
+              surface,
+              subject,
+              room,
+              space,
+              id,
+              key,
+            })
+          : undefined);
       return {
         key,
-        kind: classifySessionKey(key),
+        kind: classifySessionKey(key, entry),
+        displayName,
+        surface,
+        subject,
+        room,
+        space,
         updatedAt,
         sessionId: entry?.sessionId,
         systemSent: entry?.systemSent,
@@ -1373,7 +1447,14 @@ export async function startGatewayServer(
           wakeMode: "now" | "next-heartbeat";
           sessionKey: string;
           deliver: boolean;
-          channel: "last" | "whatsapp" | "telegram" | "discord" | "mattermost";
+          channel:
+            | "last"
+            | "whatsapp"
+            | "telegram"
+            | "discord"
+            | "mattermost"
+            | "signal"
+            | "imessage";
           to?: string;
           thinking?: string;
           timeoutSeconds?: number;
@@ -1399,15 +1480,20 @@ export async function startGatewayServer(
       channelRaw === "telegram" ||
       channelRaw === "discord" ||
       channelRaw === "mattermost" ||
+      channelRaw === "signal" ||
+      channelRaw === "imessage" ||
       channelRaw === "last"
         ? channelRaw
-        : channelRaw === undefined
-          ? "last"
-          : null;
+        : channelRaw === "imsg"
+          ? "imessage"
+          : channelRaw === undefined
+            ? "last"
+            : null;
     if (channel === null) {
       return {
         ok: false,
-        error: "channel must be last|whatsapp|telegram|discord|mattermost",
+        error:
+          "channel must be last|whatsapp|telegram|discord|mattermost|signal|imessage",
       };
     }
     const toRaw = payload.to;
@@ -1458,7 +1544,14 @@ export async function startGatewayServer(
     wakeMode: "now" | "next-heartbeat";
     sessionKey: string;
     deliver: boolean;
-    channel: "last" | "whatsapp" | "telegram" | "discord" | "mattermost";
+    channel:
+      | "last"
+      | "whatsapp"
+      | "telegram"
+      | "discord"
+      | "mattermost"
+      | "signal"
+      | "imessage";
     to?: string;
     thinking?: string;
     timeoutSeconds?: number;
@@ -1742,10 +1835,14 @@ export async function startGatewayServer(
   let telegramAbort: AbortController | null = null;
   let discordAbort: AbortController | null = null;
   let mattermostAbort: AbortController | null = null;
+  let signalAbort: AbortController | null = null;
+  let imessageAbort: AbortController | null = null;
   let whatsappTask: Promise<unknown> | null = null;
   let telegramTask: Promise<unknown> | null = null;
   let discordTask: Promise<unknown> | null = null;
   let mattermostTask: Promise<unknown> | null = null;
+  let signalTask: Promise<unknown> | null = null;
+  let imessageTask: Promise<unknown> | null = null;
   let whatsappRuntime: WebProviderStatus = {
     running: false,
     connected: false,
@@ -1791,16 +1888,96 @@ export async function startGatewayServer(
     lastStopAt: null,
     lastError: null,
   };
+  let signalRuntime: {
+    running: boolean;
+    lastStartAt?: number | null;
+    lastStopAt?: number | null;
+    lastError?: string | null;
+    baseUrl?: string | null;
+  } = {
+    running: false,
+    lastStartAt: null,
+    lastStopAt: null,
+    lastError: null,
+    baseUrl: null,
+  };
+  let imessageRuntime: {
+    running: boolean;
+    lastStartAt?: number | null;
+    lastStopAt?: number | null;
+    lastError?: string | null;
+    cliPath?: string | null;
+    dbPath?: string | null;
+  } = {
+    running: false,
+    lastStartAt: null,
+    lastStopAt: null,
+    lastError: null,
+    cliPath: null,
+    dbPath: null,
+  };
   const clients = new Set<Client>();
   let seq = 0;
   // Track per-run sequence to detect out-of-order/lost agent events.
   const agentRunSeq = new Map<string, number>();
   const dedupe = new Map<string, DedupeEntry>();
-  // Map agent sessionId -> {sessionKey, clientRunId} for chat events (WS WebChat clients).
+  // Map agent runId -> pending chat runs for WebChat clients.
   const chatRunSessions = new Map<
     string,
-    { sessionKey: string; clientRunId: string }
+    Array<{ sessionKey: string; clientRunId: string }>
   >();
+  const addChatRun = (
+    sessionId: string,
+    entry: { sessionKey: string; clientRunId: string },
+  ) => {
+    const queue = chatRunSessions.get(sessionId);
+    if (queue) {
+      queue.push(entry);
+    } else {
+      chatRunSessions.set(sessionId, [entry]);
+    }
+  };
+  const peekChatRun = (sessionId: string) =>
+    chatRunSessions.get(sessionId)?.[0];
+  const shiftChatRun = (sessionId: string) => {
+    const queue = chatRunSessions.get(sessionId);
+    if (!queue || queue.length === 0) return undefined;
+    const entry = queue.shift();
+    if (!queue.length) chatRunSessions.delete(sessionId);
+    return entry;
+  };
+  const removeChatRun = (
+    sessionId: string,
+    clientRunId: string,
+    sessionKey?: string,
+  ) => {
+    const queue = chatRunSessions.get(sessionId);
+    if (!queue || queue.length === 0) return undefined;
+    const idx = queue.findIndex(
+      (entry) =>
+        entry.clientRunId === clientRunId &&
+        (sessionKey ? entry.sessionKey === sessionKey : true),
+    );
+    if (idx < 0) return undefined;
+    const [entry] = queue.splice(idx, 1);
+    if (!queue.length) chatRunSessions.delete(sessionId);
+    return entry;
+  };
+  const resolveSessionKeyForRun = (runId: string) => {
+    const cached = getAgentRunContext(runId)?.sessionKey;
+    if (cached) return cached;
+    const cfg = loadConfig();
+    const storePath = resolveStorePath(cfg.session?.store);
+    const store = loadSessionStore(storePath);
+    const found = Object.entries(store).find(
+      ([, entry]) => entry?.sessionId === runId,
+    );
+    const sessionKey = found?.[0];
+    if (sessionKey) {
+      registerAgentRunContext(runId, { sessionKey });
+    }
+    return sessionKey;
+  };
   const chatRunBuffers = new Map<string, string>();
   const chatDeltaSentAt = new Map<string, number>();
   const chatAbortControllers = new Map<
@@ -1956,7 +2133,9 @@ export async function startGatewayServer(
       logTelegram.info("skipping provider start (telegram.enabled=false)");
       return;
     }
-    const telegramToken = loadTelegramToken(cfg, { logMissing: true });
+    const { token: telegramToken } = resolveTelegramToken(cfg, {
+      logMissingFile: (message) => logTelegram.warn(message),
+    });
     if (!telegramToken.trim()) {
       telegramRuntime = {
         ...telegramRuntime,
@@ -1964,7 +2143,7 @@ export async function startGatewayServer(
         lastError: "not configured",
       };
       logTelegram.info(
-        "skipping provider start (no TELEGRAM_BOT_TOKEN/config)",
+        "skipping provider start (no TELEGRAM_BOT_TOKEN/telegram config)",
       );
       return;
     }
@@ -2081,10 +2260,8 @@ export async function startGatewayServer(
       token: discordToken.trim(),
       runtime: discordRuntimeEnv,
       abortSignal: discordAbort.signal,
-      allowFrom: cfg.discord?.allowFrom,
-      guildAllowFrom: cfg.discord?.guildAllowFrom,
-      requireMention: cfg.discord?.requireMention,
       mediaMaxMb: cfg.discord?.mediaMaxMb,
+      historyLimit: cfg.discord?.historyLimit,
     })
       .catch((err) => {
         discordRuntime = {
@@ -2134,10 +2311,8 @@ export async function startGatewayServer(
       logMattermost.info("skipping provider start (mattermost.enabled=false)");
       return;
     }
-    const baseUrl =
-      process.env.MATTERMOST_URL ?? cfg.mattermost?.baseUrl ?? "";
-    const token =
-      process.env.MATTERMOST_TOKEN ?? cfg.mattermost?.token ?? "";
+    const baseUrl = process.env.MATTERMOST_URL ?? cfg.mattermost?.baseUrl ?? "";
+    const token = process.env.MATTERMOST_TOKEN ?? cfg.mattermost?.token ?? "";
     if (!baseUrl.trim() || !token.trim()) {
       mattermostRuntime = {
         ...mattermostRuntime,
@@ -2188,7 +2363,154 @@ export async function startGatewayServer(
           lastStopAt: Date.now(),
         };
       });
-    mattermostTask = task;
+  };
+
+  const startSignalProvider = async () => {
+    if (signalTask) return;
+    const cfg = loadConfig();
+    if (!cfg.signal) {
+      signalRuntime = {
+        ...signalRuntime,
+        running: false,
+        lastError: "not configured",
+      };
+      logSignal.info("skipping provider start (signal not configured)");
+      return;
+    }
+    if (cfg.signal?.enabled === false) {
+      signalRuntime = {
+        ...signalRuntime,
+        running: false,
+        lastError: "disabled",
+      };
+      logSignal.info("skipping provider start (signal.enabled=false)");
+      return;
+    }
+    const host = cfg.signal?.httpHost?.trim() || "127.0.0.1";
+    const port = cfg.signal?.httpPort ?? 8080;
+    const baseUrl = cfg.signal?.httpUrl?.trim() || `http://${host}:${port}`;
+    logSignal.info(`starting provider (${baseUrl})`);
+    signalAbort = new AbortController();
+    signalRuntime = {
+      ...signalRuntime,
+      running: true,
+      lastStartAt: Date.now(),
+      lastError: null,
+      baseUrl,
+    };
+    const task = monitorSignalProvider({
+      baseUrl,
+      account: cfg.signal?.account,
+      cliPath: cfg.signal?.cliPath,
+      httpHost: cfg.signal?.httpHost,
+      httpPort: cfg.signal?.httpPort,
+      autoStart: cfg.signal?.autoStart,
+      receiveMode: cfg.signal?.receiveMode,
+      ignoreAttachments: cfg.signal?.ignoreAttachments,
+      ignoreStories: cfg.signal?.ignoreStories,
+      sendReadReceipts: cfg.signal?.sendReadReceipts,
+      allowFrom: cfg.signal?.allowFrom,
+      mediaMaxMb: cfg.signal?.mediaMaxMb,
+      runtime: signalRuntimeEnv,
+      abortSignal: signalAbort.signal,
+    })
+      .catch((err) => {
+        signalRuntime = {
+          ...signalRuntime,
+          lastError: formatError(err),
+        };
+        logSignal.error(`provider exited: ${formatError(err)}`);
+      })
+      .finally(() => {
+        signalAbort = null;
+        signalTask = null;
+        signalRuntime = {
+          ...signalRuntime,
+          running: false,
+          lastStopAt: Date.now(),
+        };
+      });
+    signalTask = task;
+  };
+
+  const stopSignalProvider = async () => {
+    if (!signalAbort && !signalTask) return;
+    signalAbort?.abort();
+    try {
+      await signalTask;
+    } catch {
+      // ignore
+    }
+    signalAbort = null;
+    signalTask = null;
+    signalRuntime = {
+      ...signalRuntime,
+      running: false,
+      lastStopAt: Date.now(),
+    };
+  };
+
+  const startIMessageProvider = async () => {
+    if (imessageTask) return;
+    const cfg = loadConfig();
+    if (!cfg.imessage) {
+      imessageRuntime = {
+        ...imessageRuntime,
+        running: false,
+        lastError: "not configured",
+      };
+      logIMessage.info("skipping provider start (imessage not configured)");
+      return;
+    }
+    if (cfg.imessage?.enabled === false) {
+      imessageRuntime = {
+        ...imessageRuntime,
+        running: false,
+        lastError: "disabled",
+      };
+      logIMessage.info("skipping provider start (imessage.enabled=false)");
+      return;
+    }
+    const cliPath = cfg.imessage?.cliPath?.trim() || "imsg";
+    const dbPath = cfg.imessage?.dbPath?.trim();
+    logIMessage.info(
+      `starting provider (${cliPath}${dbPath ? ` db=${dbPath}` : ""})`,
+    );
+    imessageAbort = new AbortController();
+    imessageRuntime = {
+      ...imessageRuntime,
+      running: true,
+      lastStartAt: Date.now(),
+      lastError: null,
+      cliPath,
+      dbPath: dbPath ?? null,
+    };
+    const task = monitorIMessageProvider({
+      cliPath,
+      dbPath,
+      allowFrom: cfg.imessage?.allowFrom,
+      includeAttachments: cfg.imessage?.includeAttachments,
+      mediaMaxMb: cfg.imessage?.mediaMaxMb,
+      runtime: imessageRuntimeEnv,
+      abortSignal: imessageAbort.signal,
+    })
+      .catch((err) => {
+        imessageRuntime = {
+          ...imessageRuntime,
+          lastError: formatError(err),
+        };
+        logIMessage.error(`provider exited: ${formatError(err)}`);
+      })
+      .finally(() => {
+        imessageAbort = null;
+        imessageTask = null;
+        imessageRuntime = {
+          ...imessageRuntime,
+          running: false,
+          lastStopAt: Date.now(),
+        };
+      });
+    imessageTask = task;
   };
 
   const stopMattermostProvider = async () => {
@@ -2208,11 +2530,30 @@ export async function startGatewayServer(
     };
   };
 
+  const stopIMessageProvider = async () => {
+    if (!imessageAbort && !imessageTask) return;
+    imessageAbort?.abort();
+    try {
+      await imessageTask;
+    } catch {
+      // ignore
+    }
+    imessageAbort = null;
+    imessageTask = null;
+    imessageRuntime = {
+      ...imessageRuntime,
+      running: false,
+      lastStopAt: Date.now(),
+    };
+  };
+
   const startProviders = async () => {
     await startWhatsAppProvider();
     await startDiscordProvider();
     await startTelegramProvider();
     await startMattermostProvider();
+    await startSignalProvider();
+    await startIMessageProvider();
   };
 
   const broadcast = (
@@ -2728,6 +3069,12 @@ export async function startGatewayServer(
             verboseLevel: entry?.verboseLevel,
             model: entry?.model,
             contextTokens: entry?.contextTokens,
+            displayName: entry?.displayName,
+            chatType: entry?.chatType,
+            surface: entry?.surface,
+            subject: entry?.subject,
+            room: entry?.room,
+            space: entry?.space,
             lastChannel: entry?.lastChannel,
             lastTo: entry?.lastTo,
             skillsSnapshot: entry?.skillsSnapshot,
@@ -2973,13 +3320,7 @@ export async function startGatewayServer(
           chatAbortControllers.delete(runId);
           chatRunBuffers.delete(runId);
           chatDeltaSentAt.delete(runId);
-          const current = chatRunSessions.get(active.sessionId);
-          if (
-            current?.clientRunId === runId &&
-            current.sessionKey === sessionKey
-          ) {
-            chatRunSessions.delete(active.sessionId);
-          }
+          removeChatRun(active.sessionId, runId, sessionKey);
 
           const payload = {
             runId,
@@ -3097,10 +3438,7 @@ export async function startGatewayServer(
               sessionId,
               sessionKey: p.sessionKey,
             });
-            chatRunSessions.set(sessionId, {
-              sessionKey: p.sessionKey,
-              clientRunId,
-            });
+            addChatRun(sessionId, { sessionKey: p.sessionKey, clientRunId });
 
             if (store) {
               store[p.sessionKey] = sessionEntry;
@@ -3217,7 +3555,7 @@ export async function startGatewayServer(
 
         // Ensure chat UI clients refresh when this run completes (even though it wasn't started via chat.send).
         // This maps agent bus events (keyed by sessionId) to chat events (keyed by clientRunId).
-        chatRunSessions.set(sessionId, {
+        addChatRun(sessionId, {
           sessionKey,
           clientRunId: `voice-${randomUUID()}`,
         });
@@ -3263,7 +3601,10 @@ export async function startGatewayServer(
           typeof link?.channel === "string" ? link.channel.trim() : "";
         const channel = channelRaw.toLowerCase();
         const provider =
-          channel === "whatsapp" || channel === "telegram"
+          channel === "whatsapp" ||
+          channel === "telegram" ||
+          channel === "signal" ||
+          channel === "imessage"
             ? channel
             : undefined;
         const to =
@@ -3579,71 +3920,152 @@ export async function startGatewayServer(
     agentRunSeq.set(evt.runId, evt.seq);
     broadcast("agent", evt);
 
-    const chatLink = chatRunSessions.get(evt.runId);
-    if (chatLink) {
-      // Map agent bus events to chat events for WS WebChat clients.
-      // Use clientRunId so the webchat can correlate with its pending promise.
-      const { sessionKey, clientRunId } = chatLink;
-      bridgeSendToSession(sessionKey, "agent", evt);
-      const base = {
-        runId: clientRunId,
-        sessionKey,
-        seq: evt.seq,
-      };
-      if (evt.stream === "assistant" && typeof evt.data?.text === "string") {
-        chatRunBuffers.set(clientRunId, evt.data.text);
-        const now = Date.now();
-        const last = chatDeltaSentAt.get(clientRunId) ?? 0;
-        // Throttle UI delta events so slow clients don't accumulate unbounded buffers.
-        if (now - last >= 150) {
-          chatDeltaSentAt.set(clientRunId, now);
-          const payload = {
-            ...base,
-            state: "delta" as const,
-            message: {
-              role: "assistant",
-              content: [{ type: "text", text: evt.data.text }],
-              timestamp: now,
-            },
+    const chatLink = peekChatRun(evt.runId);
+    const sessionKey =
+      chatLink?.sessionKey ?? resolveSessionKeyForRun(evt.runId);
+    const jobState =
+      evt.stream === "job" && typeof evt.data?.state === "string"
+        ? evt.data.state
+        : null;
+
+    if (sessionKey) {
+      if (chatLink) {
+        // Map agent bus events to chat events for WS WebChat clients.
+        // Use clientRunId so the webchat can correlate with its pending promise.
+        const { clientRunId } = chatLink;
+        bridgeSendToSession(sessionKey, "agent", evt);
+        if (evt.stream === "assistant" && typeof evt.data?.text === "string") {
+          const base = {
+            runId: clientRunId,
+            sessionKey,
+            seq: evt.seq,
           };
-          broadcast("chat", payload, { dropIfSlow: true });
-          bridgeSendToSession(sessionKey, "chat", payload);
+          chatRunBuffers.set(clientRunId, evt.data.text);
+          const now = Date.now();
+          const last = chatDeltaSentAt.get(clientRunId) ?? 0;
+          // Throttle UI delta events so slow clients don't accumulate unbounded buffers.
+          if (now - last >= 150) {
+            chatDeltaSentAt.set(clientRunId, now);
+            const payload = {
+              ...base,
+              state: "delta" as const,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: evt.data.text }],
+                timestamp: now,
+              },
+            };
+            broadcast("chat", payload, { dropIfSlow: true });
+            bridgeSendToSession(sessionKey, "chat", payload);
+          }
+        } else if (jobState === "done" || jobState === "error") {
+          const finished = shiftChatRun(evt.runId);
+          if (!finished) {
+            if (jobState) clearAgentRunContext(evt.runId);
+            return;
+          }
+          const { sessionKey: finishedSessionKey, clientRunId: finishedRunId } =
+            finished;
+          const base = {
+            runId: finishedRunId,
+            sessionKey: finishedSessionKey,
+            seq: evt.seq,
+          };
+          const text = chatRunBuffers.get(finishedRunId)?.trim() ?? "";
+          chatRunBuffers.delete(finishedRunId);
+          chatDeltaSentAt.delete(finishedRunId);
+          if (jobState === "done") {
+            const payload = {
+              ...base,
+              state: "final",
+              message: text
+                ? {
+                    role: "assistant",
+                    content: [{ type: "text", text }],
+                    timestamp: Date.now(),
+                  }
+                : undefined,
+            };
+            broadcast("chat", payload);
+            bridgeSendToSession(finishedSessionKey, "chat", payload);
+          } else {
+            const payload = {
+              ...base,
+              state: "error",
+              errorMessage: evt.data.error
+                ? formatForLog(evt.data.error)
+                : undefined,
+            };
+            broadcast("chat", payload);
+            bridgeSendToSession(finishedSessionKey, "chat", payload);
+          }
         }
-      } else if (
-        evt.stream === "job" &&
-        typeof evt.data?.state === "string" &&
-        (evt.data.state === "done" || evt.data.state === "error")
-      ) {
-        const text = chatRunBuffers.get(clientRunId)?.trim() ?? "";
-        chatRunBuffers.delete(clientRunId);
-        chatDeltaSentAt.delete(clientRunId);
-        if (evt.data.state === "done") {
-          const payload = {
-            ...base,
-            state: "final",
-            message: text
-              ? {
-                  role: "assistant",
-                  content: [{ type: "text", text }],
-                  timestamp: Date.now(),
-                }
-              : undefined,
+      } else {
+        const clientRunId = evt.runId;
+        bridgeSendToSession(sessionKey, "agent", evt);
+        if (evt.stream === "assistant" && typeof evt.data?.text === "string") {
+          const base = {
+            runId: clientRunId,
+            sessionKey,
+            seq: evt.seq,
           };
-          broadcast("chat", payload);
-          bridgeSendToSession(sessionKey, "chat", payload);
-        } else {
-          const payload = {
-            ...base,
-            state: "error",
-            errorMessage: evt.data.error
-              ? formatForLog(evt.data.error)
-              : undefined,
+          chatRunBuffers.set(clientRunId, evt.data.text);
+          const now = Date.now();
+          const last = chatDeltaSentAt.get(clientRunId) ?? 0;
+          if (now - last >= 150) {
+            chatDeltaSentAt.set(clientRunId, now);
+            const payload = {
+              ...base,
+              state: "delta" as const,
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: evt.data.text }],
+                timestamp: now,
+              },
+            };
+            broadcast("chat", payload, { dropIfSlow: true });
+            bridgeSendToSession(sessionKey, "chat", payload);
+          }
+        } else if (jobState === "done" || jobState === "error") {
+          const base = {
+            runId: clientRunId,
+            sessionKey,
+            seq: evt.seq,
           };
-          broadcast("chat", payload);
-          bridgeSendToSession(sessionKey, "chat", payload);
+          const text = chatRunBuffers.get(clientRunId)?.trim() ?? "";
+          chatRunBuffers.delete(clientRunId);
+          chatDeltaSentAt.delete(clientRunId);
+          if (jobState === "done") {
+            const payload = {
+              ...base,
+              state: "final",
+              message: text
+                ? {
+                    role: "assistant",
+                    content: [{ type: "text", text }],
+                    timestamp: Date.now(),
+                  }
+                : undefined,
+            };
+            broadcast("chat", payload);
+            bridgeSendToSession(sessionKey, "chat", payload);
+          } else {
+            const payload = {
+              ...base,
+              state: "error",
+              errorMessage: evt.data.error
+                ? formatForLog(evt.data.error)
+                : undefined,
+            };
+            broadcast("chat", payload);
+            bridgeSendToSession(sessionKey, "chat", payload);
+          }
         }
-        chatRunSessions.delete(evt.runId);
       }
+    }
+
+    if (jobState === "done" || jobState === "error") {
+      clearAgentRunContext(evt.runId);
     }
   });
 
@@ -4057,14 +4479,8 @@ export async function startGatewayServer(
                   ? Math.max(1000, timeoutMsRaw)
                   : 10_000;
               const cfg = loadConfig();
-              const envToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
-              const configToken = cfg.telegram?.botToken?.trim();
-              const telegramToken = envToken || configToken || "";
-              const tokenSource = envToken
-                ? "env"
-                : configToken
-                  ? "config"
-                  : "none";
+              const { token: telegramToken, source: tokenSource } =
+                resolveTelegramToken(cfg);
               let telegramProbe: TelegramProbe | undefined;
               let lastProbeAt: number | null = null;
               if (probe && telegramToken) {
@@ -4091,14 +4507,11 @@ export async function startGatewayServer(
                 discordLastProbeAt = Date.now();
               }
 
-              const mattermostEnvUrl =
-                process.env.MATTERMOST_URL?.trim() ?? "";
-              const mattermostConfigUrl =
-                cfg.mattermost?.baseUrl?.trim() ?? "";
+              const mattermostEnvUrl = process.env.MATTERMOST_URL?.trim() ?? "";
+              const mattermostConfigUrl = cfg.mattermost?.baseUrl?.trim() ?? "";
               const mattermostEnvToken =
                 process.env.MATTERMOST_TOKEN?.trim() ?? "";
-              const mattermostConfigToken =
-                cfg.mattermost?.token?.trim() ?? "";
+              const mattermostConfigToken = cfg.mattermost?.token?.trim() ?? "";
               const mattermostUrl = mattermostEnvUrl || mattermostConfigUrl;
               const mattermostToken =
                 mattermostEnvToken || mattermostConfigToken;
@@ -4112,6 +4525,32 @@ export async function startGatewayServer(
                 : mattermostConfigToken
                   ? "config"
                   : "none";
+
+              const signalCfg = cfg.signal;
+              const signalEnabled = signalCfg?.enabled !== false;
+              const signalHost = signalCfg?.httpHost?.trim() || "127.0.0.1";
+              const signalPort = signalCfg?.httpPort ?? 8080;
+              const signalBaseUrl =
+                signalCfg?.httpUrl?.trim() ||
+                `http://${signalHost}:${signalPort}`;
+              const signalConfigured = Boolean(signalCfg) && signalEnabled;
+              let signalProbe: SignalProbe | undefined;
+              let signalLastProbeAt: number | null = null;
+              if (probe && signalConfigured) {
+                signalProbe = await probeSignal(signalBaseUrl, timeoutMs);
+                signalLastProbeAt = Date.now();
+              }
+
+              const imessageCfg = cfg.imessage;
+              const imessageEnabled = imessageCfg?.enabled !== false;
+              const imessageConfigured =
+                Boolean(imessageCfg) && imessageEnabled;
+              let imessageProbe: IMessageProbe | undefined;
+              let imessageLastProbeAt: number | null = null;
+              if (probe && imessageConfigured) {
+                imessageProbe = await probeIMessage(timeoutMs);
+                imessageLastProbeAt = Date.now();
+              }
 
               const linked = await webAuthExists();
               const authAgeMs = getWebAuthAgeMs();
@@ -4164,6 +4603,27 @@ export async function startGatewayServer(
                     lastStartAt: mattermostRuntime.lastStartAt ?? null,
                     lastStopAt: mattermostRuntime.lastStopAt ?? null,
                     lastError: mattermostRuntime.lastError ?? null,
+                  },
+                  signal: {
+                    configured: signalConfigured,
+                    baseUrl: signalBaseUrl,
+                    running: signalRuntime.running,
+                    lastStartAt: signalRuntime.lastStartAt ?? null,
+                    lastStopAt: signalRuntime.lastStopAt ?? null,
+                    lastError: signalRuntime.lastError ?? null,
+                    probe: signalProbe,
+                    lastProbeAt: signalLastProbeAt,
+                  },
+                  imessage: {
+                    configured: imessageConfigured,
+                    running: imessageRuntime.running,
+                    lastStartAt: imessageRuntime.lastStartAt ?? null,
+                    lastStopAt: imessageRuntime.lastStopAt ?? null,
+                    lastError: imessageRuntime.lastError ?? null,
+                    cliPath: imessageRuntime.cliPath ?? null,
+                    dbPath: imessageRuntime.dbPath ?? null,
+                    probe: imessageProbe,
+                    lastProbeAt: imessageLastProbeAt,
                   },
                 },
                 undefined,
@@ -4256,13 +4716,7 @@ export async function startGatewayServer(
               chatAbortControllers.delete(runId);
               chatRunBuffers.delete(runId);
               chatDeltaSentAt.delete(runId);
-              const current = chatRunSessions.get(active.sessionId);
-              if (
-                current?.clientRunId === runId &&
-                current.sessionKey === sessionKey
-              ) {
-                chatRunSessions.delete(active.sessionId);
-              }
+              removeChatRun(active.sessionId, runId, sessionKey);
 
               const payload = {
                 runId,
@@ -4387,7 +4841,7 @@ export async function startGatewayServer(
                   sessionId,
                   sessionKey: p.sessionKey,
                 });
-                chatRunSessions.set(sessionId, {
+                addChatRun(sessionId, {
                   sessionKey: p.sessionKey,
                   clientRunId,
                 });
@@ -6024,11 +6478,13 @@ export async function startGatewayServer(
               }
               const to = params.to.trim();
               const message = params.message.trim();
-              const provider = (params.provider ?? "whatsapp").toLowerCase();
+              const providerRaw = (params.provider ?? "whatsapp").toLowerCase();
+              const provider =
+                providerRaw === "imsg" ? "imessage" : providerRaw;
               try {
                 if (provider === "telegram") {
                   const cfg = loadConfig();
-                  const token = loadTelegramToken(cfg);
+                  const { token } = resolveTelegramToken(cfg);
                   const result = await sendMessageTelegram(to, message, {
                     mediaUrl: params.mediaUrl,
                     verbose: isVerbose(),
@@ -6069,6 +6525,49 @@ export async function startGatewayServer(
                     runId: idem,
                     postId: result.postId,
                     channelId: result.channelId,
+                    provider,
+                  };
+                  dedupe.set(`send:${idem}`, {
+                    ts: Date.now(),
+                    ok: true,
+                    payload,
+                  });
+                  respond(true, payload, undefined, { provider });
+                } else if (provider === "signal") {
+                  const cfg = loadConfig();
+                  const host = cfg.signal?.httpHost?.trim() || "127.0.0.1";
+                  const port = cfg.signal?.httpPort ?? 8080;
+                  const baseUrl =
+                    cfg.signal?.httpUrl?.trim() || `http://${host}:${port}`;
+                  const result = await sendMessageSignal(to, message, {
+                    mediaUrl: params.mediaUrl,
+                    baseUrl,
+                    account: cfg.signal?.account,
+                  });
+                  const payload = {
+                    runId: idem,
+                    messageId: result.messageId,
+                    provider,
+                  };
+                  dedupe.set(`send:${idem}`, {
+                    ts: Date.now(),
+                    ok: true,
+                    payload,
+                  });
+                  respond(true, payload, undefined, { provider });
+                } else if (provider === "imessage") {
+                  const cfg = loadConfig();
+                  const result = await sendMessageIMessage(to, message, {
+                    mediaUrl: params.mediaUrl,
+                    cliPath: cfg.imessage?.cliPath,
+                    dbPath: cfg.imessage?.dbPath,
+                    maxBytes: cfg.imessage?.mediaMaxMb
+                      ? cfg.imessage.mediaMaxMb * 1024 * 1024
+                      : undefined,
+                  });
+                  const payload = {
+                    runId: idem,
+                    messageId: result.messageId,
                     provider,
                   };
                   dedupe.set(`send:${idem}`, {
@@ -6179,7 +6678,7 @@ export async function startGatewayServer(
                 const mainKey =
                   (cfg.session?.mainKey ?? "main").trim() || "main";
                 if (requestedSessionKey === mainKey) {
-                  chatRunSessions.set(sessionId, {
+                  addChatRun(sessionId, {
                     sessionKey: requestedSessionKey,
                     clientRunId: idem,
                   });
@@ -6191,9 +6690,13 @@ export async function startGatewayServer(
 
               const requestedChannelRaw =
                 typeof params.channel === "string" ? params.channel.trim() : "";
-              const requestedChannel = requestedChannelRaw
+              const requestedChannelNormalized = requestedChannelRaw
                 ? requestedChannelRaw.toLowerCase()
                 : "last";
+              const requestedChannel =
+                requestedChannelNormalized === "imsg"
+                  ? "imessage"
+                  : requestedChannelNormalized;
 
               const lastChannel = sessionEntry?.lastChannel;
               const lastTo =
@@ -6214,6 +6717,8 @@ export async function startGatewayServer(
                   requestedChannel === "telegram" ||
                   requestedChannel === "discord" ||
                   requestedChannel === "mattermost" ||
+                  requestedChannel === "signal" ||
+                  requestedChannel === "imessage" ||
                   requestedChannel === "webchat"
                 ) {
                   return requestedChannel;
@@ -6233,7 +6738,9 @@ export async function startGatewayServer(
                   resolvedChannel === "whatsapp" ||
                   resolvedChannel === "telegram" ||
                   resolvedChannel === "discord" ||
-                  resolvedChannel === "mattermost"
+                  resolvedChannel === "mattermost" ||
+                  resolvedChannel === "signal" ||
+                  resolvedChannel === "imessage"
                 ) {
                   return lastTo || undefined;
                 }
@@ -6479,6 +6986,8 @@ export async function startGatewayServer(
       await stopTelegramProvider();
       await stopDiscordProvider();
       await stopMattermostProvider();
+      await stopSignalProvider();
+      await stopIMessageProvider();
       cron.stop();
       heartbeatRunner.stop();
       broadcast("shutdown", {
@@ -6516,9 +7025,13 @@ export async function startGatewayServer(
         await stopBrowserControlServerIfStarted().catch(() => {});
       }
       await Promise.allSettled(
-        [whatsappTask, telegramTask, mattermostTask].filter(
-          Boolean,
-        ) as Array<Promise<unknown>>,
+        [
+          whatsappTask,
+          telegramTask,
+          mattermostTask,
+          signalTask,
+          imessageTask,
+        ].filter(Boolean) as Array<Promise<unknown>>,
       );
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       await new Promise<void>((resolve, reject) =>

@@ -6,13 +6,25 @@ export type BrowserStatus = {
   enabled: boolean;
   controlUrl: string;
   running: boolean;
+  cdpReady?: boolean;
+  cdpHttp?: boolean;
   pid: number | null;
   cdpPort: number;
+  cdpUrl?: string;
   chosenBrowser: string | null;
   userDataDir: string | null;
   color: string;
   headless: boolean;
+  noSandbox?: boolean;
+  executablePath?: string | null;
   attachOnly: boolean;
+};
+
+export type BrowserResetProfileResult = {
+  ok: true;
+  moved: boolean;
+  from: string;
+  to?: string;
 };
 
 export type BrowserTab = {
@@ -73,6 +85,18 @@ export async function browserStop(baseUrl: string): Promise<void> {
     method: "POST",
     timeoutMs: 15000,
   });
+}
+
+export async function browserResetProfile(
+  baseUrl: string,
+): Promise<BrowserResetProfileResult> {
+  return await fetchBrowserJson<BrowserResetProfileResult>(
+    `${baseUrl}/reset-profile`,
+    {
+      method: "POST",
+      timeoutMs: 20000,
+    },
+  );
 }
 
 export async function browserTabs(baseUrl: string): Promise<BrowserTab[]> {

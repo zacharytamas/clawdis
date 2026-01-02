@@ -23,8 +23,8 @@ public struct ClawdisChatView: View {
         static let composerPaddingHorizontal: CGFloat = 0
         static let stackSpacing: CGFloat = 0
         static let messageSpacing: CGFloat = 6
-        static let messageListPaddingTop: CGFloat = 0
-        static let messageListPaddingBottom: CGFloat = 4
+        static let messageListPaddingTop: CGFloat = 12
+        static let messageListPaddingBottom: CGFloat = 16
         static let messageListPaddingHorizontal: CGFloat = 6
         #else
         static let outerPaddingHorizontal: CGFloat = 6
@@ -32,7 +32,7 @@ public struct ClawdisChatView: View {
         static let composerPaddingHorizontal: CGFloat = 6
         static let stackSpacing: CGFloat = 6
         static let messageSpacing: CGFloat = 12
-        static let messageListPaddingTop: CGFloat = 4
+        static let messageListPaddingTop: CGFloat = 10
         static let messageListPaddingBottom: CGFloat = 6
         static let messageListPaddingHorizontal: CGFloat = 8
         #endif
@@ -58,7 +58,10 @@ public struct ClawdisChatView: View {
             VStack(spacing: Layout.stackSpacing) {
                 self.messageList
                     .padding(.horizontal, Layout.outerPaddingHorizontal)
-                ClawdisChatComposer(viewModel: self.viewModel, style: self.style)
+                ClawdisChatComposer(
+                    viewModel: self.viewModel,
+                    style: self.style,
+                    showsSessionSwitcher: self.showsSessionSwitcher)
                     .padding(.horizontal, Layout.composerPaddingHorizontal)
             }
             .padding(.vertical, Layout.outerPaddingVertical)
@@ -86,7 +89,7 @@ public struct ClawdisChatView: View {
                     }
 
                     Color.clear
-                        .frame(height: 0)
+                        .frame(height: Layout.messageListPaddingBottom)
                         .id(self.scrollerBottomID)
                 }
                 // Use scroll targets for stable auto-scroll without ScrollViewReader relayout glitches.
@@ -125,6 +128,9 @@ public struct ClawdisChatView: View {
             guard !isLoading, !self.hasPerformedInitialScroll else { return }
             self.scrollPosition = self.scrollerBottomID
             self.hasPerformedInitialScroll = true
+        }
+        .onChange(of: self.viewModel.sessionKey) { _, _ in
+            self.hasPerformedInitialScroll = false
         }
         .onChange(of: self.viewModel.messages.count) { _, _ in
             guard self.hasPerformedInitialScroll else { return }

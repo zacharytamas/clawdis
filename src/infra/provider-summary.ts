@@ -1,6 +1,6 @@
-import fs from "node:fs";
 import chalk from "chalk";
 import { type ClawdisConfig, loadConfig } from "../config/config.js";
+import { resolveTelegramToken } from "../telegram/token.js";
 import { normalizeE164 } from "../utils.js";
 import {
   getWebAuthAgeMs,
@@ -35,12 +35,8 @@ export async function buildProviderSummary(
   if (!telegramEnabled) {
     lines.push(chalk.cyan("Telegram: disabled"));
   } else {
-    const telegramToken =
-      process.env.TELEGRAM_BOT_TOKEN ?? effective.telegram?.botToken;
-    const telegramTokenFile = effective.telegram?.tokenFile?.trim();
-    const telegramConfigured =
-      Boolean(telegramToken) ||
-      Boolean(telegramTokenFile ? fs.existsSync(telegramTokenFile) : false);
+    const { token: telegramToken } = resolveTelegramToken(effective);
+    const telegramConfigured = Boolean(telegramToken);
     lines.push(
       telegramConfigured
         ? chalk.green("Telegram: configured")
@@ -67,6 +63,34 @@ export async function buildProviderSummary(
     const label = host ? `Mattermost: configured (${host})` : "Mattermost: configured";
     lines.push(
       baseUrl && token ? chalk.green(label) : chalk.cyan("Mattermost: not configured"),
+    );
+  }
+
+  const signalEnabled = effective.signal?.enabled !== false;
+  if (!signalEnabled) {
+    lines.push(chalk.cyan("Signal: disabled"));
+  } else {
+    const signalConfigured = Boolean(
+      effective.signal?.httpUrl ||
+        effective.signal?.cliPath ||
+        effective.signal?.account,
+    );
+    lines.push(
+      signalConfigured
+        ? chalk.green("Signal: configured")
+        : chalk.cyan("Signal: not configured"),
+    );
+  }
+
+  const imessageEnabled = effective.imessage?.enabled !== false;
+  if (!imessageEnabled) {
+    lines.push(chalk.cyan("iMessage: disabled"));
+  } else {
+    const imessageConfigured = Boolean(effective.imessage);
+    lines.push(
+      imessageConfigured
+        ? chalk.green("iMessage: configured")
+        : chalk.cyan("iMessage: not configured"),
     );
   }
 

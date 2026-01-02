@@ -1015,7 +1015,7 @@ describe("web auto-reply", () => {
       .mockResolvedValueOnce({ text: "ok" });
 
     const { storePath, cleanup } = await makeSessionStore({
-      "group:123@g.us": {
+      "whatsapp:group:123@g.us": {
         sessionId: "g-1",
         updatedAt: Date.now(),
         groupActivation: "always",
@@ -1415,7 +1415,7 @@ describe("web auto-reply", () => {
     resetLoadConfigMock();
   });
 
-  it("skips responsePrefix for HEARTBEAT_OK responses", async () => {
+  it("does not deliver HEARTBEAT_OK responses", async () => {
     setLoadConfigMock(() => ({
       routing: {
         allowFrom: ["*"],
@@ -1456,8 +1456,7 @@ describe("web auto-reply", () => {
       sendMedia: vi.fn(),
     });
 
-    // HEARTBEAT_OK should NOT have prefix - clawdis needs exact match
-    expect(reply).toHaveBeenCalledWith(HEARTBEAT_TOKEN);
+    expect(reply).not.toHaveBeenCalled();
     resetLoadConfigMock();
   });
 

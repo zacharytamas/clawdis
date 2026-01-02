@@ -27,6 +27,7 @@ export type ClawdisSkillMetadata = {
   primaryEnv?: string;
   emoji?: string;
   homepage?: string;
+  os?: string[];
   requires?: {
     bins?: string[];
     env?: string[];
@@ -37,7 +38,7 @@ export type ClawdisSkillMetadata = {
 
 export type SkillsInstallPreferences = {
   preferBrew: boolean;
-  nodeManager: "npm" | "pnpm" | "yarn";
+  nodeManager: "npm" | "pnpm" | "yarn" | "bun";
 };
 
 type ParsedSkillFrontmatter = Record<string, string>;
@@ -179,10 +180,17 @@ export function resolveSkillsInstallPreferences(
     typeof raw?.nodeManager === "string" ? raw.nodeManager.trim() : "";
   const manager = managerRaw.toLowerCase();
   const nodeManager =
-    manager === "pnpm" || manager === "yarn" || manager === "npm"
+    manager === "pnpm" ||
+    manager === "yarn" ||
+    manager === "bun" ||
+    manager === "npm"
       ? (manager as SkillsInstallPreferences["nodeManager"])
       : "npm";
   return { preferBrew, nodeManager };
+}
+
+export function resolveRuntimePlatform(): string {
+  return process.platform;
 }
 
 export function resolveConfigPath(
@@ -223,9 +231,7 @@ export function resolveSkillConfig(
 function normalizeAllowlist(input: unknown): string[] | undefined {
   if (!input) return undefined;
   if (!Array.isArray(input)) return undefined;
-  const normalized = input
-    .map((entry) => String(entry).trim())
-    .filter(Boolean);
+  const normalized = input.map((entry) => String(entry).trim()).filter(Boolean);
   return normalized.length > 0 ? normalized : undefined;
 }
 
@@ -279,6 +285,7 @@ function resolveClawdisMetadata(
     const install = installRaw
       .map((entry) => parseInstallSpec(entry))
       .filter((entry): entry is SkillInstallSpec => Boolean(entry));
+    const osRaw = normalizeStringList(clawdisObj.os);
     return {
       always:
         typeof clawdisObj.always === "boolean" ? clawdisObj.always : undefined,
@@ -296,6 +303,7 @@ function resolveClawdisMetadata(
         typeof clawdisObj.primaryEnv === "string"
           ? clawdisObj.primaryEnv
           : undefined,
+      os: osRaw.length > 0 ? osRaw : undefined,
       requires: requiresRaw
         ? {
             bins: normalizeStringList(requiresRaw.bins),
@@ -322,9 +330,13 @@ function shouldIncludeSkill(params: {
   const skillKey = resolveSkillKey(entry.skill, entry);
   const skillConfig = resolveSkillConfig(config, skillKey);
   const allowBundled = normalizeAllowlist(config?.skills?.allowBundled);
+  const osList = entry.clawdis?.os ?? [];
 
   if (skillConfig?.enabled === false) return false;
   if (!isBundledSkillAllowed(entry, allowBundled)) return false;
+  if (osList.length > 0 && !osList.includes(resolveRuntimePlatform())) {
+    return false;
+  }
   if (entry.clawdis?.always === true) {
     return true;
   }

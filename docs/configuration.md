@@ -41,6 +41,22 @@ If set, CLAWDIS derives defaults (only when you haven’t set them explicitly):
 }
 ```
 
+### `wizard`
+
+Metadata written by CLI wizards (`onboard`, `configure`, `doctor`, `update`).
+
+```json5
+{
+  wizard: {
+    lastRunAt: "2026-01-01T00:00:00.000Z",
+    lastRunVersion: "2.0.0-beta5",
+    lastRunCommit: "abc1234",
+    lastRunCommand: "configure",
+    lastRunMode: "local"
+  }
+}
+```
+
 ### `logging`
 
 - Default log file: `/tmp/clawdis/clawdis-YYYY-MM-DD.log`
@@ -72,7 +88,7 @@ Allowlist of E.164 phone numbers that may trigger auto-replies.
 
 ### `routing.groupChat`
 
-Group messages default to **require mention** (either metadata mention or regex patterns).
+Group messages default to **require mention** (either metadata mention or regex patterns). Applies to WhatsApp, Telegram, Discord, Mattermost, and iMessage group chats.
 
 ```json5
 {
@@ -98,6 +114,8 @@ Controls how inbound messages behave when an agent run is already active.
         whatsapp: "interrupt",
         telegram: "interrupt",
         discord: "queue",
+        mattermost: "interrupt",
+        imessage: "interrupt",
         webchat: "queue"
       }
     }
@@ -156,18 +174,56 @@ Configure the Discord bot by setting the bot token and optional gating:
   discord: {
     enabled: true,
     token: "your-bot-token",
-    allowFrom: ["discord:1234567890", "*"], // optional DM allowlist (user ids)
-    guildAllowFrom: {
-      guilds: ["123456789012345678"],      // optional guild allowlist (ids)
-      users: ["987654321098765432"]        // optional user allowlist (ids)
+    mediaMaxMb: 8,                          // clamp inbound media size
+    enableReactions: true,                  // allow agent-triggered reactions
+    dm: {
+      enabled: true,                        // disable all DMs when false
+      allowFrom: ["1234567890", "steipete"], // optional DM allowlist (ids or names)
+      groupEnabled: false,                 // enable group DMs
+      groupChannels: ["clawd-dm"]          // optional group DM allowlist
     },
-    requireMention: true,                   // require @bot mentions in guilds
-    mediaMaxMb: 8                           // clamp inbound media size
+    guilds: {
+      "123456789012345678": {               // guild id (preferred) or slug
+        slug: "friends-of-clawd",
+        requireMention: false,              // per-guild default
+        users: ["987654321098765432"],      // optional per-guild user allowlist
+        channels: {
+          general: { allow: true },
+          help: { allow: true, requireMention: true }
+        }
+      }
+    },
+    historyLimit: 20                        // include last N guild messages as context
   }
 }
 ```
 
 Clawdis reads `DISCORD_BOT_TOKEN` or `discord.token` to start the provider (unless `discord.enabled` is `false`). Use `user:<id>` (DM) or `channel:<id>` (guild channel) when specifying delivery targets for cron/CLI commands.
+Guild slugs are lowercase with spaces replaced by `-`; channel keys use the slugged channel name (no leading `#`). Prefer guild ids as keys to avoid rename ambiguity.
+
+### `imessage` (imsg CLI)
+
+Clawdis spawns `imsg rpc` (JSON-RPC over stdio). No daemon or port required.
+
+```json5
+{
+  imessage: {
+    enabled: true,
+    cliPath: "imsg",
+    dbPath: "~/Library/Messages/chat.db",
+    allowFrom: ["+15555550123", "user@example.com", "chat_id:123"],
+    includeAttachments: false,
+    mediaMaxMb: 16,
+    service: "auto",
+    region: "US"
+  }
+}
+```
+
+Notes:
+- Requires Full Disk Access to the Messages DB.
+- The first send will prompt for Messages automation permission.
+- Prefer `chat_id:<id>` targets. Use `imsg chats --limit 20` to list chats.
 
 ### `agent.workspace`
 
@@ -266,7 +322,7 @@ Z.AI models are available as `zai/<model>` (e.g. `zai/glm-4.7`) and require
 - `every`: duration string (`ms`, `s`, `m`, `h`); default unit minutes. Omit or set
   `0m` to disable.
 - `model`: optional override model for heartbeat runs (`provider/model`).
-- `target`: optional delivery channel (`last`, `whatsapp`, `telegram`, `discord`, `none`). Default: `last`.
+- `target`: optional delivery channel (`last`, `whatsapp`, `telegram`, `discord`, `imessage`, `none`). Default: `last`.
 - `to`: optional recipient override (E.164 for WhatsApp, chat id for Telegram).
 - `prompt`: optional override for the heartbeat body (default: `HEARTBEAT`).
 
@@ -446,6 +502,7 @@ Clawdis can start a **dedicated, isolated** Chrome/Chromium instance for clawd a
 Defaults:
 - enabled: `true`
 - control URL: `http://127.0.0.1:18791` (CDP uses `18792`)
+- CDP URL: `http://127.0.0.1:18792` (control URL + 1)
 - profile color: `#FF4500` (lobster-orange)
 - Note: the control server is started by the running gateway (Clawdis.app menubar, or `clawdis gateway`).
 
@@ -454,10 +511,13 @@ Defaults:
   browser: {
     enabled: true,
     controlUrl: "http://127.0.0.1:18791",
+    // cdpUrl: "http://127.0.0.1:18792", // override for remote CDP
     color: "#FF4500",
     // Advanced:
     // headless: false,
-    // attachOnly: false,
+    // noSandbox: false,
+    // executablePath: "/usr/bin/chromium",
+    // attachOnly: false, // set true when tunneling a remote CDP to localhost
   }
 }
 ```
@@ -507,6 +567,24 @@ Auth and Tailscale:
 - `gateway.tailscale.mode: "serve"` uses Tailscale Serve (tailnet only, loopback bind).
 - `gateway.tailscale.mode: "funnel"` exposes the dashboard publicly; requires auth.
 - `gateway.tailscale.resetOnExit` resets Serve/Funnel config on shutdown.
+
+Remote client defaults (CLI):
+- `gateway.remote.url` sets the default Gateway WebSocket URL for CLI calls when `gateway.mode = "remote"`.
+- `gateway.remote.token` supplies the token for remote calls (leave unset for no auth).
+- `gateway.remote.password` supplies the password for remote calls (leave unset for no auth).
+
+```json5
+{
+  gateway: {
+    mode: "remote",
+    remote: {
+      url: "ws://gateway.tailnet:18789",
+      token: "your-token",
+      password: "your-password"
+    }
+  }
+}
+```
 
 ### `hooks` (Gateway webhooks)
 
@@ -678,7 +756,7 @@ Template placeholders are expanded in `routing.transcribeAudio.command` (and any
 | `{{GroupMembers}}` | Group members preview (best effort) |
 | `{{SenderName}}` | Sender display name (best effort) |
 | `{{SenderE164}}` | Sender phone number (best effort) |
-| `{{Surface}}` | Surface hint (whatsapp|telegram|discord|webchat|…) |
+| `{{Surface}}` | Surface hint (whatsapp|telegram|discord|imessage|webchat|…) |
 
 ## Cron (Gateway scheduler)
 

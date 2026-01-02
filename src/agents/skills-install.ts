@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import type { ClawdisConfig } from "../config/config.js";
 import { runCommandWithTimeout } from "../process/exec.js";
 import { resolveUserPath } from "../utils.js";
@@ -26,6 +29,42 @@ export type SkillInstallResult = {
   code: number | null;
 };
 
+function summarizeInstallOutput(text: string): string | undefined {
+  const raw = text.trim();
+  if (!raw) return undefined;
+  const lines = raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return undefined;
+
+  const preferred =
+    lines.find((line) => /^error\b/i.test(line)) ??
+    lines.find((line) => /\b(err!|error:|failed)\b/i.test(line)) ??
+    lines.at(-1);
+
+  if (!preferred) return undefined;
+  const normalized = preferred.replace(/\s+/g, " ").trim();
+  const maxLen = 200;
+  return normalized.length > maxLen
+    ? `${normalized.slice(0, maxLen - 1)}…`
+    : normalized;
+}
+
+function formatInstallFailureMessage(result: {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}): string {
+  const code =
+    typeof result.code === "number" ? `exit ${result.code}` : "unknown exit";
+  const summary =
+    summarizeInstallOutput(result.stderr) ??
+    summarizeInstallOutput(result.stdout);
+  if (!summary) return `Install failed (${code})`;
+  return `Install failed (${code}): ${summary}`;
+}
+
 function resolveInstallId(spec: SkillInstallSpec, index: number): string {
   return (spec.id ?? `${spec.kind}-${index}`).trim();
 }
@@ -50,6 +89,8 @@ function buildNodeInstallCommand(
       return ["pnpm", "add", "-g", packageName];
     case "yarn":
       return ["yarn", "global", "add", packageName];
+    case "bun":
+      return ["bun", "add", "-g", packageName];
     default:
       return ["npm", "install", "-g", packageName];
   }
@@ -84,6 +125,31 @@ function buildInstallCommand(
     default:
       return { argv: null, error: "unsupported installer" };
   }
+}
+
+async function resolveBrewBinDir(
+  timeoutMs: number,
+): Promise<string | undefined> {
+  if (!hasBinary("brew")) return undefined;
+  const prefixResult = await runCommandWithTimeout(["brew", "--prefix"], {
+    timeoutMs: Math.min(timeoutMs, 30_000),
+  });
+  if (prefixResult.code === 0) {
+    const prefix = prefixResult.stdout.trim();
+    if (prefix) return path.join(prefix, "bin");
+  }
+
+  const envPrefix = process.env.HOMEBREW_PREFIX?.trim();
+  if (envPrefix) return path.join(envPrefix, "bin");
+
+  for (const candidate of ["/opt/homebrew/bin", "/usr/local/bin"]) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // ignore
+    }
+  }
+  return undefined;
 }
 
 export async function installSkill(
@@ -128,6 +194,15 @@ export async function installSkill(
       code: null,
     };
   }
+  if (spec.kind === "brew" && !hasBinary("brew")) {
+    return {
+      ok: false,
+      message: "brew not installed",
+      stdout: "",
+      stderr: "",
+      code: null,
+    };
+  }
   if (spec.kind === "uv" && !hasBinary("uv")) {
     if (hasBinary("brew")) {
       const brewResult = await runCommandWithTimeout(
@@ -165,20 +240,60 @@ export async function installSkill(
     };
   }
 
+  if (spec.kind === "go" && !hasBinary("go")) {
+    if (hasBinary("brew")) {
+      const brewResult = await runCommandWithTimeout(
+        ["brew", "install", "go"],
+        {
+          timeoutMs,
+        },
+      );
+      if (brewResult.code !== 0) {
+        return {
+          ok: false,
+          message: "Failed to install go (brew)",
+          stdout: brewResult.stdout.trim(),
+          stderr: brewResult.stderr.trim(),
+          code: brewResult.code,
+        };
+      }
+    } else {
+      return {
+        ok: false,
+        message: "go not installed (install via brew)",
+        stdout: "",
+        stderr: "",
+        code: null,
+      };
+    }
+  }
+
+  let env: NodeJS.ProcessEnv | undefined;
+  if (spec.kind === "go" && hasBinary("brew")) {
+    const brewBin = await resolveBrewBinDir(timeoutMs);
+    if (brewBin) env = { GOBIN: brewBin };
+  }
+
   const result = await (async () => {
     const argv = command.argv;
     if (!argv || argv.length === 0) {
       return { code: null, stdout: "", stderr: "invalid install command" };
     }
-    return runCommandWithTimeout(argv, {
-      timeoutMs,
-    });
+    try {
+      return await runCommandWithTimeout(argv, {
+        timeoutMs,
+        env,
+      });
+    } catch (err) {
+      const stderr = err instanceof Error ? err.message : String(err);
+      return { code: null, stdout: "", stderr };
+    }
   })();
 
   const success = result.code === 0;
   return {
     ok: success,
-    message: success ? "Installed" : "Install failed",
+    message: success ? "Installed" : formatInstallFailureMessage(result),
     stdout: result.stdout.trim(),
     stderr: result.stderr.trim(),
     code: result.code,

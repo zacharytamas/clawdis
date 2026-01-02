@@ -27,9 +27,11 @@ import {
 } from "../agents/workspace.js";
 import { type ClawdisConfig, loadConfig } from "../config/config.js";
 import {
+  buildGroupDisplayName,
   DEFAULT_IDLE_MINUTES,
   DEFAULT_RESET_TRIGGERS,
   loadSessionStore,
+  resolveGroupSessionKey,
   resolveSessionKey,
   resolveSessionTranscriptPath,
   resolveStorePath,
@@ -37,6 +39,7 @@ import {
   saveSessionStore,
 } from "../config/sessions.js";
 import { logVerbose } from "../globals.js";
+import { registerAgentRunContext } from "../infra/agent-events.js";
 import { buildProviderSummary } from "../infra/provider-summary.js";
 import { triggerClawdisRestart } from "../infra/restart.js";
 import {
@@ -52,6 +55,7 @@ import {
   normalizeGroupActivation,
   parseActivationCommand,
 } from "./group-activation.js";
+import { stripHeartbeatToken } from "./heartbeat.js";
 import { extractModelDirective } from "./model.js";
 import { buildStatusMessage } from "./status.js";
 import type { MsgContext, TemplateContext } from "./templating.js";
@@ -362,9 +366,9 @@ export async function getReplyFromConfig(
   let persistedModelOverride: string | undefined;
   let persistedProviderOverride: string | undefined;
 
+  const groupResolution = resolveGroupSessionKey(ctx);
   const isGroup =
-    typeof ctx.From === "string" &&
-    (ctx.From.includes("@g.us") || ctx.From.startsWith("group:"));
+    ctx.ChatType?.trim().toLowerCase() === "group" || Boolean(groupResolution);
   const triggerBodyNormalized = stripStructuralPrefixes(ctx.Body ?? "")
     .trim()
     .toLowerCase();
@@ -397,6 +401,13 @@ export async function getReplyFromConfig(
 
   sessionKey = resolveSessionKey(sessionScope, ctx, mainKey);
   sessionStore = loadSessionStore(storePath);
+  if (groupResolution?.legacyKey && groupResolution.legacyKey !== sessionKey) {
+    const legacyEntry = sessionStore[groupResolution.legacyKey];
+    if (legacyEntry && !sessionStore[sessionKey]) {
+      sessionStore[sessionKey] = legacyEntry;
+      delete sessionStore[groupResolution.legacyKey];
+    }
+  }
   const entry = sessionStore[sessionKey];
   const idleMs = idleMinutes * 60_000;
   const freshEntry = entry && Date.now() - entry.updatedAt <= idleMs;
@@ -429,7 +440,41 @@ export async function getReplyFromConfig(
     modelOverride: persistedModelOverride ?? baseEntry?.modelOverride,
     providerOverride: persistedProviderOverride ?? baseEntry?.providerOverride,
     queueMode: baseEntry?.queueMode,
+    displayName: baseEntry?.displayName,
+    chatType: baseEntry?.chatType,
+    surface: baseEntry?.surface,
+    subject: baseEntry?.subject,
+    room: baseEntry?.room,
+    space: baseEntry?.space,
   };
+  if (groupResolution?.surface) {
+    const surface = groupResolution.surface;
+    const subject = ctx.GroupSubject?.trim();
+    const space = ctx.GroupSpace?.trim();
+    const explicitRoom = ctx.GroupRoom?.trim();
+    const isRoomSurface = surface === "discord" || surface === "slack";
+    const nextRoom =
+      explicitRoom ??
+      (isRoomSurface && subject && subject.startsWith("#")
+        ? subject
+        : undefined);
+    const nextSubject = nextRoom ? undefined : subject;
+    sessionEntry.chatType = groupResolution.chatType ?? "group";
+    sessionEntry.surface = surface;
+    if (nextSubject) sessionEntry.subject = nextSubject;
+    if (nextRoom) sessionEntry.room = nextRoom;
+    if (space) sessionEntry.space = space;
+    sessionEntry.displayName = buildGroupDisplayName({
+      surface: sessionEntry.surface,
+      subject: sessionEntry.subject,
+      room: sessionEntry.room,
+      space: sessionEntry.space,
+      id: groupResolution.id,
+      key: sessionKey,
+    });
+  } else if (!sessionEntry.chatType) {
+    sessionEntry.chatType = "direct";
+  }
   sessionStore[sessionKey] = sessionEntry;
   await saveSessionStore(storePath, sessionStore);
 
@@ -886,10 +931,10 @@ export async function getReplyFromConfig(
       cleanupTyping();
       return undefined;
     }
-    triggerClawdisRestart();
+    const restartMethod = triggerClawdisRestart();
     cleanupTyping();
     return {
-      text: "⚙️ Restarting clawdis via launchctl; give me a few seconds to come back online.",
+      text: `⚙️ Restarting clawdis via ${restartMethod}; give me a few seconds to come back online.`,
     };
   }
 
@@ -1037,8 +1082,7 @@ export async function getReplyFromConfig(
   // Prepend queued system events (transitions only) and (for new main sessions) a provider snapshot.
   // Token efficiency: we filter out periodic/heartbeat noise and keep the lines compact.
   const isGroupSession =
-    typeof ctx.From === "string" &&
-    (ctx.From.includes("@g.us") || ctx.From.startsWith("group:"));
+    sessionEntry?.chatType === "group" || sessionEntry?.chatType === "room";
   const isMainSession =
     !isGroupSession && sessionKey === (sessionCfg?.mainKey ?? "main");
   if (isMainSession) {
@@ -1191,11 +1235,15 @@ export async function getReplyFromConfig(
     return undefined;
   }
 
+  let didLogHeartbeatStrip = false;
   try {
     if (shouldEagerType) {
       await startTypingLoop();
     }
     const runId = crypto.randomUUID();
+    if (sessionKey) {
+      registerAgentRunContext(runId, { sessionKey });
+    }
     let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
     try {
       runResult = await runEmbeddedPiAgent({
@@ -1217,9 +1265,24 @@ export async function getReplyFromConfig(
         runId,
         onPartialReply: opts?.onPartialReply
           ? async (payload) => {
-              await startTypingOnText(payload.text);
+              let text = payload.text;
+              if (!opts?.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
+                const stripped = stripHeartbeatToken(text, { mode: "message" });
+                if (stripped.didStrip && !didLogHeartbeatStrip) {
+                  didLogHeartbeatStrip = true;
+                  logVerbose("Stripped stray HEARTBEAT_OK token from reply");
+                }
+                if (
+                  stripped.shouldSkip &&
+                  (payload.mediaUrls?.length ?? 0) === 0
+                ) {
+                  return;
+                }
+                text = stripped.text;
+              }
+              await startTypingOnText(text);
               await opts.onPartialReply?.({
-                text: payload.text,
+                text,
                 mediaUrls: payload.mediaUrls,
               });
             }
@@ -1227,11 +1290,23 @@ export async function getReplyFromConfig(
         shouldEmitToolResult,
         onToolResult: opts?.onToolResult
           ? async (payload) => {
-              await startTypingOnText(payload.text);
-              await opts.onToolResult?.({
-                text: payload.text,
-                mediaUrls: payload.mediaUrls,
-              });
+              let text = payload.text;
+              if (!opts?.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
+                const stripped = stripHeartbeatToken(text, { mode: "message" });
+                if (stripped.didStrip && !didLogHeartbeatStrip) {
+                  didLogHeartbeatStrip = true;
+                  logVerbose("Stripped stray HEARTBEAT_OK token from reply");
+                }
+                if (
+                  stripped.shouldSkip &&
+                  (payload.mediaUrls?.length ?? 0) === 0
+                ) {
+                  return;
+                }
+                text = stripped.text;
+              }
+              await startTypingOnText(text);
+              await opts.onToolResult?.({ text, mediaUrls: payload.mediaUrls });
             }
           : undefined,
       });
@@ -1262,7 +1337,26 @@ export async function getReplyFromConfig(
 
     const payloadArray = runResult.payloads ?? [];
     if (payloadArray.length === 0) return undefined;
-    const shouldSignalTyping = payloadArray.some((payload) => {
+
+    const sanitizedPayloads = opts?.isHeartbeat
+      ? payloadArray
+      : payloadArray.flatMap((payload) => {
+          const text = payload.text;
+          if (!text || !text.includes("HEARTBEAT_OK")) return [payload];
+          const stripped = stripHeartbeatToken(text, { mode: "message" });
+          if (stripped.didStrip && !didLogHeartbeatStrip) {
+            didLogHeartbeatStrip = true;
+            logVerbose("Stripped stray HEARTBEAT_OK token from reply");
+          }
+          const hasMedia =
+            Boolean(payload.mediaUrl) || (payload.mediaUrls?.length ?? 0) > 0;
+          if (stripped.shouldSkip && !hasMedia) return [];
+          return [{ ...payload, text: stripped.text }];
+        });
+
+    if (sanitizedPayloads.length === 0) return undefined;
+
+    const shouldSignalTyping = sanitizedPayloads.some((payload) => {
       const trimmed = payload.text?.trim();
       if (trimmed && trimmed !== SILENT_REPLY_TOKEN) return true;
       if (payload.mediaUrl) return true;
@@ -1317,11 +1411,11 @@ export async function getReplyFromConfig(
     }
 
     // If verbose is enabled and this is a new session, prepend a session hint.
-    let finalPayloads = payloadArray;
+    let finalPayloads = sanitizedPayloads;
     if (resolvedVerboseLevel === "on" && isNewSession) {
       finalPayloads = [
         { text: `🧭 New session: ${sessionIdFinal}` },
-        ...payloadArray,
+        ...finalPayloads,
       ];
     }
 

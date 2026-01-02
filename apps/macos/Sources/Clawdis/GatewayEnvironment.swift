@@ -219,6 +219,9 @@ enum GatewayEnvironment {
     }
 
     private static func preferredGatewayBind() -> String? {
+        if CommandResolver.connectionModeIsRemote() {
+            return nil
+        }
         if let env = ProcessInfo.processInfo.environment["CLAWDIS_GATEWAY_BIND"] {
             let trimmed = env.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if self.supportedBindModes.contains(trimmed) {
@@ -257,12 +260,33 @@ enum GatewayEnvironment {
             }
 
         statusHandler("Installing clawdis@\(target) via \(label)…")
-        let response = await ShellExecutor.run(command: cmd, cwd: nil, env: ["PATH": preferred], timeout: 300)
-        if response.ok {
+
+        func summarize(_ text: String) -> String? {
+            let lines = text
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard let last = lines.last else { return nil }
+            let normalized = last.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            return normalized.count > 200 ? String(normalized.prefix(199)) + "…" : normalized
+        }
+
+        let response = await ShellExecutor.runDetailed(command: cmd, cwd: nil, env: ["PATH": preferred], timeout: 300)
+        if response.success {
             statusHandler("Installed clawdis@\(target)")
         } else {
-            let detail = response.message ?? "install failed"
-            statusHandler("Install failed: \(detail)")
+            if response.timedOut {
+                statusHandler("Install failed: timed out. Check your internet connection and try again.")
+                return
+            }
+
+            let exit = response.exitCode.map { "exit \($0)" } ?? (response.errorMessage ?? "failed")
+            let detail = summarize(response.stderr) ?? summarize(response.stdout)
+            if let detail {
+                statusHandler("Install failed (\(exit)): \(detail)")
+            } else {
+                statusHandler("Install failed (\(exit))")
+            }
         }
     }
 

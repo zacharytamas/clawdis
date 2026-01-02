@@ -100,6 +100,11 @@ export type GatewaySessionsDefaults = {
 export type GatewaySessionRow = {
   key: string;
   kind: "direct" | "group" | "global" | "unknown";
+  displayName?: string;
+  surface?: string;
+  subject?: string;
+  room?: string;
+  space?: string;
   updatedAt: number | null;
   sessionId?: string;
   systemSent?: boolean;
@@ -222,16 +227,19 @@ export type SkillStatusEntry = {
   homepage?: string;
   always: boolean;
   disabled: boolean;
+  blockedByAllowlist: boolean;
   eligible: boolean;
   requirements: {
     bins: string[];
     env: string[];
     config: string[];
+    os: string[];
   };
   missing: {
     bins: string[];
     env: string[];
     config: string[];
+    os: string[];
   };
   configChecks: SkillsStatusConfigCheck[];
   install: SkillInstallOption[];

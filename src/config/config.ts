@@ -62,10 +62,16 @@ export type BrowserConfig = {
   enabled?: boolean;
   /** Base URL of the clawd browser control server. Default: http://127.0.0.1:18791 */
   controlUrl?: string;
+  /** Base URL of the CDP endpoint. Default: controlUrl with port + 1. */
+  cdpUrl?: string;
   /** Accent color for the clawd browser profile (hex). Default: #FF4500 */
   color?: string;
+  /** Override the browser executable path (macOS/Linux). */
+  executablePath?: string;
   /** Start Chrome headless (best-effort). Default: false */
   headless?: boolean;
+  /** Pass --no-sandbox to Chrome (Linux containers). Default: false */
+  noSandbox?: boolean;
   /** If true: never launch; only attach to an existing browser. Default: false */
   attachOnly?: boolean;
 };
@@ -96,7 +102,14 @@ export type HookMappingConfig = {
   messageTemplate?: string;
   textTemplate?: string;
   deliver?: boolean;
-  channel?: "last" | "whatsapp" | "telegram" | "discord" | "mattermost";
+  channel?:
+    | "last"
+    | "whatsapp"
+    | "telegram"
+    | "discord"
+    | "mattermost"
+    | "signal"
+    | "imessage";
   to?: string;
   thinking?: string;
   timeoutSeconds?: number;
@@ -152,16 +165,81 @@ export type TelegramConfig = {
   webhookPath?: string;
 };
 
+export type DiscordDmConfig = {
+  /** If false, ignore all incoming Discord DMs. Default: true. */
+  enabled?: boolean;
+  /** Allowlist for DM senders (ids or names). */
+  allowFrom?: Array<string | number>;
+  /** If true, allow group DMs (default: false). */
+  groupEnabled?: boolean;
+  /** Optional allowlist for group DM channels (ids or slugs). */
+  groupChannels?: Array<string | number>;
+};
+
+export type DiscordGuildChannelConfig = {
+  allow?: boolean;
+  requireMention?: boolean;
+};
+
+export type DiscordGuildEntry = {
+  slug?: string;
+  requireMention?: boolean;
+  users?: Array<string | number>;
+  channels?: Record<string, DiscordGuildChannelConfig>;
+};
+
 export type DiscordConfig = {
   /** If false, do not start the Discord provider. Default: true. */
   enabled?: boolean;
   token?: string;
+  mediaMaxMb?: number;
+  historyLimit?: number;
+  /** Allow agent-triggered Discord reactions (default: true). */
+  enableReactions?: boolean;
+  dm?: DiscordDmConfig;
+  /** New per-guild config keyed by guild id or slug. */
+  guilds?: Record<string, DiscordGuildEntry>;
+};
+
+export type SignalConfig = {
+  /** If false, do not start the Signal provider. Default: true. */
+  enabled?: boolean;
+  /** Optional explicit E.164 account for signal-cli. */
+  account?: string;
+  /** Optional full base URL for signal-cli HTTP daemon. */
+  httpUrl?: string;
+  /** HTTP host for signal-cli daemon (default 127.0.0.1). */
+  httpHost?: string;
+  /** HTTP port for signal-cli daemon (default 8080). */
+  httpPort?: number;
+  /** signal-cli binary path (default: signal-cli). */
+  cliPath?: string;
+  /** Auto-start signal-cli daemon (default: true if httpUrl not set). */
+  autoStart?: boolean;
+  receiveMode?: "on-start" | "manual";
+  ignoreAttachments?: boolean;
+  ignoreStories?: boolean;
+  sendReadReceipts?: boolean;
   allowFrom?: Array<string | number>;
-  guildAllowFrom?: {
-    guilds?: Array<string | number>;
-    users?: Array<string | number>;
-  };
-  requireMention?: boolean;
+  mediaMaxMb?: number;
+};
+
+export type IMessageConfig = {
+  /** If false, do not start the iMessage provider. Default: true. */
+  enabled?: boolean;
+  /** imsg CLI binary path (default: imsg). */
+  cliPath?: string;
+  /** Optional Messages db path override. */
+  dbPath?: string;
+  /** Optional default send service (imessage|sms|auto). */
+  service?: "imessage" | "sms" | "auto";
+  /** Optional default region (used when sending SMS). */
+  region?: string;
+  /** Optional allowlist for inbound handles or chat_id targets. */
+  allowFrom?: Array<string | number>;
+  /** Include attachments + reactions in watch payloads. */
+  includeAttachments?: boolean;
+  /** Max outbound media size in MB. */
   mediaMaxMb?: number;
 };
 
@@ -182,6 +260,8 @@ export type QueueModeBySurface = {
   whatsapp?: QueueMode;
   telegram?: QueueMode;
   discord?: QueueMode;
+  signal?: QueueMode;
+  imessage?: QueueMode;
   webchat?: QueueMode;
   mattermost?: QueueMode;
 };
@@ -283,6 +363,15 @@ export type GatewayTailscaleConfig = {
   resetOnExit?: boolean;
 };
 
+export type GatewayRemoteConfig = {
+  /** Remote Gateway WebSocket URL (ws:// or wss://). */
+  url?: string;
+  /** Token for remote auth (when the gateway requires token auth). */
+  token?: string;
+  /** Password for remote auth (when the gateway requires password auth). */
+  password?: string;
+};
+
 export type GatewayConfig = {
   /**
    * Explicit gateway mode. When set to "remote", local gateway start is disabled.
@@ -297,6 +386,7 @@ export type GatewayConfig = {
   controlUi?: GatewayControlUiConfig;
   auth?: GatewayAuthConfig;
   tailscale?: GatewayTailscaleConfig;
+  remote?: GatewayRemoteConfig;
 };
 
 export type SkillConfig = {
@@ -316,7 +406,7 @@ export type SkillsLoadConfig = {
 
 export type SkillsInstallConfig = {
   preferBrew?: boolean;
-  nodeManager?: "npm" | "pnpm" | "yarn";
+  nodeManager?: "npm" | "pnpm" | "yarn" | "bun";
 };
 
 export type SkillsConfig = {
@@ -378,6 +468,13 @@ export type ClawdisConfig = {
     theme?: string;
     emoji?: string;
   };
+  wizard?: {
+    lastRunAt?: string;
+    lastRunVersion?: string;
+    lastRunCommit?: string;
+    lastRunCommand?: string;
+    lastRunMode?: "local" | "remote";
+  };
   logging?: LoggingConfig;
   browser?: BrowserConfig;
   ui?: {
@@ -411,8 +508,16 @@ export type ClawdisConfig = {
       every?: string;
       /** Heartbeat model override (provider/model). */
       model?: string;
-      /** Delivery target (last|whatsapp|telegram|discord|mattermost|none). */
-      target?: "last" | "whatsapp" | "telegram" | "discord" | "mattermost" | "none";
+      /** Delivery target (last|whatsapp|telegram|discord|mattermost|signal|imessage|none). */
+      target?:
+        | "last"
+        | "whatsapp"
+        | "telegram"
+        | "discord"
+        | "mattermost"
+        | "signal"
+        | "imessage"
+        | "none";
       /** Optional delivery override (E.164 for WhatsApp, chat id for Telegram). */
       to?: string;
       /** Override the heartbeat prompt body (default: "HEARTBEAT"). */
@@ -437,6 +542,8 @@ export type ClawdisConfig = {
   telegram?: TelegramConfig;
   discord?: DiscordConfig;
   mattermost?: MattermostConfig;
+  signal?: SignalConfig;
+  imessage?: IMessageConfig;
   cron?: CronConfig;
   hooks?: HooksConfig;
   bridge?: BridgeConfig;
@@ -530,6 +637,8 @@ const QueueModeBySurfaceSchema = z
     whatsapp: QueueModeSchema.optional(),
     telegram: QueueModeSchema.optional(),
     discord: QueueModeSchema.optional(),
+    signal: QueueModeSchema.optional(),
+    imessage: QueueModeSchema.optional(),
     webchat: QueueModeSchema.optional(),
     mattermost: QueueModeSchema.optional(),
   })
@@ -577,6 +686,8 @@ const HeartbeatSchema = z
         z.literal("telegram"),
         z.literal("discord"),
         z.literal("mattermost"),
+        z.literal("signal"),
+        z.literal("imessage"),
         z.literal("none"),
       ])
       .optional(),
@@ -636,6 +747,8 @@ const HookMappingSchema = z
         z.literal("telegram"),
         z.literal("discord"),
         z.literal("mattermost"),
+        z.literal("signal"),
+        z.literal("imessage"),
       ])
       .optional(),
     to: z.string().optional(),
@@ -687,6 +800,17 @@ const ClawdisSchema = z.object({
       emoji: z.string().optional(),
     })
     .optional(),
+  wizard: z
+    .object({
+      lastRunAt: z.string().optional(),
+      lastRunVersion: z.string().optional(),
+      lastRunCommit: z.string().optional(),
+      lastRunCommand: z.string().optional(),
+      lastRunMode: z
+        .union([z.literal("local"), z.literal("remote")])
+        .optional(),
+    })
+    .optional(),
   logging: z
     .object({
       level: z
@@ -721,8 +845,11 @@ const ClawdisSchema = z.object({
     .object({
       enabled: z.boolean().optional(),
       controlUrl: z.string().optional(),
+      cdpUrl: z.string().optional(),
       color: z.string().optional(),
+      executablePath: z.string().optional(),
       headless: z.boolean().optional(),
+      noSandbox: z.boolean().optional(),
       attachOnly: z.boolean().optional(),
     })
     .optional(),
@@ -818,14 +945,85 @@ const ClawdisSchema = z.object({
     .object({
       enabled: z.boolean().optional(),
       token: z.string().optional(),
-      allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
-      guildAllowFrom: z
+      mediaMaxMb: z.number().positive().optional(),
+      historyLimit: z.number().int().min(0).optional(),
+      enableReactions: z.boolean().optional(),
+      dm: z
         .object({
-          guilds: z.array(z.union([z.string(), z.number()])).optional(),
-          users: z.array(z.union([z.string(), z.number()])).optional(),
+          enabled: z.boolean().optional(),
+          allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
+          groupEnabled: z.boolean().optional(),
+          groupChannels: z.array(z.union([z.string(), z.number()])).optional(),
         })
         .optional(),
-      requireMention: z.boolean().optional(),
+      guilds: z
+        .record(
+          z.string(),
+          z
+            .object({
+              slug: z.string().optional(),
+              requireMention: z.boolean().optional(),
+              users: z.array(z.union([z.string(), z.number()])).optional(),
+              channels: z
+                .record(
+                  z.string(),
+                  z
+                    .object({
+                      allow: z.boolean().optional(),
+                      requireMention: z.boolean().optional(),
+                    })
+                    .optional(),
+                )
+                .optional(),
+            })
+            .optional(),
+        )
+        .optional(),
+      guild: z
+        .object({
+          allowFrom: z
+            .object({
+              guilds: z.array(z.union([z.string(), z.number()])).optional(),
+              users: z.array(z.union([z.string(), z.number()])).optional(),
+            })
+            .optional(),
+          channels: z.array(z.union([z.string(), z.number()])).optional(),
+          requireMention: z.boolean().optional(),
+          historyLimit: z.number().int().min(0).optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+  signal: z
+    .object({
+      enabled: z.boolean().optional(),
+      account: z.string().optional(),
+      httpUrl: z.string().optional(),
+      httpHost: z.string().optional(),
+      httpPort: z.number().int().positive().optional(),
+      cliPath: z.string().optional(),
+      autoStart: z.boolean().optional(),
+      receiveMode: z
+        .union([z.literal("on-start"), z.literal("manual")])
+        .optional(),
+      ignoreAttachments: z.boolean().optional(),
+      ignoreStories: z.boolean().optional(),
+      sendReadReceipts: z.boolean().optional(),
+      allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
+      mediaMaxMb: z.number().positive().optional(),
+    })
+    .optional(),
+  imessage: z
+    .object({
+      enabled: z.boolean().optional(),
+      cliPath: z.string().optional(),
+      dbPath: z.string().optional(),
+      service: z
+        .union([z.literal("imessage"), z.literal("sms"), z.literal("auto")])
+        .optional(),
+      region: z.string().optional(),
+      allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
+      includeAttachments: z.boolean().optional(),
       mediaMaxMb: z.number().positive().optional(),
     })
     .optional(),
@@ -911,6 +1109,13 @@ const ClawdisSchema = z.object({
           resetOnExit: z.boolean().optional(),
         })
         .optional(),
+      remote: z
+        .object({
+          url: z.string().optional(),
+          token: z.string().optional(),
+          password: z.string().optional(),
+        })
+        .optional(),
     })
     .optional(),
   skills: z
@@ -925,20 +1130,27 @@ const ClawdisSchema = z.object({
         .object({
           preferBrew: z.boolean().optional(),
           nodeManager: z
-            .union([z.literal("npm"), z.literal("pnpm"), z.literal("yarn")])
+            .union([
+              z.literal("npm"),
+              z.literal("pnpm"),
+              z.literal("yarn"),
+              z.literal("bun"),
+            ])
             .optional(),
         })
         .optional(),
-      entries: z.record(
-        z.string(),
-        z
-          .object({
-            enabled: z.boolean().optional(),
-            apiKey: z.string().optional(),
-            env: z.record(z.string(), z.string()).optional(),
-          })
-          .passthrough(),
-      ).optional(),
+      entries: z
+        .record(
+          z.string(),
+          z
+            .object({
+              enabled: z.boolean().optional(),
+              apiKey: z.string().optional(),
+              env: z.record(z.string(), z.string()).optional(),
+            })
+            .passthrough(),
+        )
+        .optional(),
     })
     .optional(),
 });

@@ -13,6 +13,7 @@ vi.mock("../agents/pi-embedded.js", () => ({
 
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
 import { getReplyFromConfig } from "./reply.js";
+import { HEARTBEAT_TOKEN } from "./tokens.js";
 
 const webMocks = vi.hoisted(() => ({
   webAuthExists: vi.fn().mockResolvedValue(true),
@@ -160,6 +161,56 @@ describe("trigger handling", () => {
     });
   });
 
+  it("suppresses HEARTBEAT_OK replies outside heartbeat runs", async () => {
+    await withTempHome(async (home) => {
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
+        payloads: [{ text: HEARTBEAT_TOKEN }],
+        meta: {
+          durationMs: 1,
+          agentMeta: { sessionId: "s", provider: "p", model: "m" },
+        },
+      });
+
+      const res = await getReplyFromConfig(
+        {
+          Body: "hello",
+          From: "+1002",
+          To: "+2000",
+        },
+        {},
+        makeCfg(home),
+      );
+
+      expect(res).toBeUndefined();
+      expect(runEmbeddedPiAgent).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("strips HEARTBEAT_OK at edges outside heartbeat runs", async () => {
+    await withTempHome(async (home) => {
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
+        payloads: [{ text: `${HEARTBEAT_TOKEN} hello` }],
+        meta: {
+          durationMs: 1,
+          agentMeta: { sessionId: "s", provider: "p", model: "m" },
+        },
+      });
+
+      const res = await getReplyFromConfig(
+        {
+          Body: "hello",
+          From: "+1002",
+          To: "+2000",
+        },
+        {},
+        makeCfg(home),
+      );
+
+      const text = Array.isArray(res) ? res[0]?.text : res?.text;
+      expect(text).toBe("hello");
+    });
+  });
+
   it("updates group activation when the owner sends /activation", async () => {
     await withTempHome(async (home) => {
       const cfg = makeCfg(home);
@@ -169,6 +220,7 @@ describe("trigger handling", () => {
           From: "123@g.us",
           To: "+2000",
           ChatType: "group",
+          Surface: "whatsapp",
           SenderE164: "+2000",
         },
         {},
@@ -179,7 +231,7 @@ describe("trigger handling", () => {
       const store = JSON.parse(
         await fs.readFile(cfg.session.store, "utf-8"),
       ) as Record<string, { groupActivation?: string }>;
-      expect(store["group:123@g.us"]?.groupActivation).toBe("always");
+      expect(store["whatsapp:group:123@g.us"]?.groupActivation).toBe("always");
       expect(runEmbeddedPiAgent).not.toHaveBeenCalled();
     });
   });
@@ -193,6 +245,7 @@ describe("trigger handling", () => {
           From: "123@g.us",
           To: "+2000",
           ChatType: "group",
+          Surface: "whatsapp",
           SenderE164: "+999",
         },
         {},
@@ -219,6 +272,7 @@ describe("trigger handling", () => {
           From: "123@g.us",
           To: "+2000",
           ChatType: "group",
+          Surface: "whatsapp",
           SenderE164: "+2000",
           GroupSubject: "Test Group",
           GroupMembers: "Alice (+1), Bob (+2)",

@@ -433,10 +433,7 @@ export async function runEmbeddedPiAgent(params: {
           tools,
         });
 
-        const sessionManager = SessionManager.open(
-          params.sessionFile,
-          agentDir,
-        );
+        const sessionManager = SessionManager.open(params.sessionFile);
         const settingsManager = SettingsManager.create(
           resolvedWorkspace,
           agentDir,

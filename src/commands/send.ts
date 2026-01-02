@@ -1,7 +1,9 @@
 import type { CliDeps } from "../cli/deps.js";
+import { loadConfig } from "../config/config.js";
 import { callGateway, randomIdempotencyKey } from "../gateway/call.js";
 import { success } from "../globals.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { resolveTelegramToken } from "../telegram/token.js";
 
 export async function sendCommand(
   opts: {
@@ -25,8 +27,9 @@ export async function sendCommand(
   }
 
   if (provider === "telegram") {
+    const { token } = resolveTelegramToken(loadConfig());
     const result = await deps.sendMessageTelegram(opts.to, opts.message, {
-      token: process.env.TELEGRAM_BOT_TOKEN,
+      token: token || undefined,
       mediaUrl: opts.media,
     });
     runtime.log(
@@ -108,6 +111,54 @@ export async function sendCommand(
     return;
   }
 
+  if (provider === "signal") {
+    const result = await deps.sendMessageSignal(opts.to, opts.message, {
+      mediaUrl: opts.media,
+    });
+    runtime.log(success(`✅ Sent via signal. Message ID: ${result.messageId}`));
+    if (opts.json) {
+      runtime.log(
+        JSON.stringify(
+          {
+            provider: "signal",
+            via: "direct",
+            to: opts.to,
+            messageId: result.messageId,
+            mediaUrl: opts.media ?? null,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    return;
+  }
+
+  if (provider === "imessage" || provider === "imsg") {
+    const result = await deps.sendMessageIMessage(opts.to, opts.message, {
+      mediaUrl: opts.media,
+    });
+    runtime.log(
+      success(`✅ Sent via iMessage. Message ID: ${result.messageId}`),
+    );
+    if (opts.json) {
+      runtime.log(
+        JSON.stringify(
+          {
+            provider: "imessage",
+            via: "direct",
+            to: opts.to,
+            messageId: result.messageId,
+            mediaUrl: opts.media ?? null,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    return;
+  }
+
   // Always send via gateway over WS to avoid multi-session corruption.
   const sendViaGateway = async () =>
     callGateway<{
@@ -119,6 +170,7 @@ export async function sendCommand(
         to: opts.to,
         message: opts.message,
         mediaUrl: opts.media,
+        provider,
         idempotencyKey: randomIdempotencyKey(),
       },
       timeoutMs: 10_000,

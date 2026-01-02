@@ -8,11 +8,15 @@ import { WebSocket } from "ws";
 import { agentCommand } from "../commands/agent.js";
 import {
   CONFIG_PATH_CLAWDIS,
-  STATE_DIR_CLAWDIS,
   readConfigFileSnapshot,
+  STATE_DIR_CLAWDIS,
   writeConfigFile,
 } from "../config/config.js";
-import { emitAgentEvent } from "../infra/agent-events.js";
+import {
+  emitAgentEvent,
+  registerAgentRunContext,
+  resetAgentRunContextForTest,
+} from "../infra/agent-events.js";
 import { GatewayLockError } from "../infra/gateway-lock.js";
 import { emitHeartbeatEvent } from "../infra/heartbeat-events.js";
 import { drainSystemEvents, peekSystemEvents } from "../infra/system-events.js";
@@ -277,6 +281,7 @@ beforeEach(async () => {
   testCanvasHostPort = undefined;
   cronIsolatedRun.mockClear();
   drainSystemEvents();
+  resetAgentRunContextForTest();
   __resetModelCatalogCacheForTest();
   piSdkMock.enabled = false;
   piSdkMock.discoverCalls = 0;
@@ -1871,6 +1876,61 @@ describe("gateway server", () => {
     await server.close();
   });
 
+  test("agent routes main last-channel signal", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
+    testSessionStorePath = path.join(dir, "sessions.json");
+    await fs.writeFile(
+      testSessionStorePath,
+      JSON.stringify(
+        {
+          main: {
+            sessionId: "sess-signal",
+            updatedAt: Date.now(),
+            lastChannel: "signal",
+            lastTo: "+15551234567",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    ws.send(
+      JSON.stringify({
+        type: "req",
+        id: "agent-last-signal",
+        method: "agent",
+        params: {
+          message: "hi",
+          sessionKey: "main",
+          channel: "last",
+          deliver: true,
+          idempotencyKey: "idem-agent-last-signal",
+        },
+      }),
+    );
+    await onceMessage(
+      ws,
+      (o) => o.type === "res" && o.id === "agent-last-signal",
+    );
+
+    const spy = vi.mocked(agentCommand);
+    expect(spy).toHaveBeenCalled();
+    const call = spy.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(call.provider).toBe("signal");
+    expect(call.to).toBe("+15551234567");
+    expect(call.deliver).toBe(true);
+    expect(call.bestEffortDeliver).toBe(true);
+    expect(call.sessionId).toBe("sess-signal");
+
+    ws.close();
+    await server.close();
+  });
+
   test("agent ignores webchat last-channel for routing", async () => {
     testAllowFrom = ["+1555"];
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
@@ -2053,7 +2113,10 @@ describe("gateway server", () => {
     );
     expect(res.ok).toBe(true);
     const payload = res.payload as
-      | { type?: unknown; snapshot?: { configPath?: string; stateDir?: string } }
+      | {
+          type?: unknown;
+          snapshot?: { configPath?: string; stateDir?: string };
+        }
       | undefined;
     expect(payload?.type).toBe("hello-ok");
     expect(payload?.snapshot?.configPath).toBe(CONFIG_PATH_CLAWDIS);
@@ -2134,6 +2197,11 @@ describe("gateway server", () => {
         probe?: unknown;
         lastProbeAt?: unknown;
       };
+      signal?: {
+        configured?: boolean;
+        probe?: unknown;
+        lastProbeAt?: unknown;
+      };
     }>(ws, "providers.status", { probe: false, timeoutMs: 2000 });
     expect(res.ok).toBe(true);
     expect(res.payload?.whatsapp).toBeTruthy();
@@ -2141,6 +2209,9 @@ describe("gateway server", () => {
     expect(res.payload?.telegram?.tokenSource).toBe("none");
     expect(res.payload?.telegram?.probe).toBeUndefined();
     expect(res.payload?.telegram?.lastProbeAt).toBeNull();
+    expect(res.payload?.signal?.configured).toBe(false);
+    expect(res.payload?.signal?.probe).toBeUndefined();
+    expect(res.payload?.signal?.lastProbeAt).toBeNull();
 
     ws.close();
     await server.close();
@@ -3121,6 +3192,121 @@ describe("gateway server", () => {
     await server.close();
   });
 
+  test("chat.send preserves run ordering for queued runs", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
+    testSessionStorePath = path.join(dir, "sessions.json");
+    await fs.writeFile(
+      testSessionStorePath,
+      JSON.stringify(
+        {
+          main: {
+            sessionId: "sess-main",
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws);
+
+    ws.send(
+      JSON.stringify({
+        type: "req",
+        id: "chat-1",
+        method: "chat.send",
+        params: {
+          sessionKey: "main",
+          message: "first",
+          idempotencyKey: "idem-1",
+        },
+      }),
+    );
+    const res1 = await onceMessage(
+      ws,
+      (o) => o.type === "res" && o.id === "chat-1",
+    );
+    expect(res1.ok).toBe(true);
+
+    ws.send(
+      JSON.stringify({
+        type: "req",
+        id: "chat-2",
+        method: "chat.send",
+        params: {
+          sessionKey: "main",
+          message: "second",
+          idempotencyKey: "idem-2",
+        },
+      }),
+    );
+    const res2 = await onceMessage(
+      ws,
+      (o) => o.type === "res" && o.id === "chat-2",
+    );
+    expect(res2.ok).toBe(true);
+
+    const final1P = onceMessage<{
+      type: "event";
+      event: string;
+      payload?: unknown;
+    }>(
+      ws,
+      (o) => {
+        if (o.type !== "event" || o.event !== "chat") return false;
+        const payload = o.payload as { state?: unknown } | undefined;
+        return payload?.state === "final";
+      },
+      8000,
+    );
+
+    emitAgentEvent({
+      runId: "sess-main",
+      stream: "job",
+      data: { state: "done" },
+    });
+
+    const final1 = await final1P;
+    const run1 =
+      final1.payload && typeof final1.payload === "object"
+        ? (final1.payload as { runId?: string }).runId
+        : undefined;
+    expect(run1).toBe("idem-1");
+
+    const final2P = onceMessage<{
+      type: "event";
+      event: string;
+      payload?: unknown;
+    }>(
+      ws,
+      (o) => {
+        if (o.type !== "event" || o.event !== "chat") return false;
+        const payload = o.payload as { state?: unknown } | undefined;
+        return payload?.state === "final";
+      },
+      8000,
+    );
+
+    emitAgentEvent({
+      runId: "sess-main",
+      stream: "job",
+      data: { state: "done" },
+    });
+
+    const final2 = await final2P;
+    const run2 =
+      final2.payload && typeof final2.payload === "object"
+        ? (final2.payload as { runId?: string }).runId
+        : undefined;
+    expect(run2).toBe("idem-2");
+
+    ws.close();
+    await server.close();
+  });
+
   test("bridge RPC chat.history returns session messages", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
     testSessionStorePath = path.join(dir, "sessions.json");
@@ -3440,6 +3626,75 @@ describe("gateway server", () => {
     await server.close();
   });
 
+  test("agent events stream to webchat clients when run context is registered", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
+    testSessionStorePath = path.join(dir, "sessions.json");
+    await fs.writeFile(
+      testSessionStorePath,
+      JSON.stringify(
+        {
+          main: {
+            sessionId: "sess-main",
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const { server, ws } = await startServerWithClient();
+    await connectOk(ws, {
+      client: {
+        name: "webchat",
+        version: "1.0.0",
+        platform: "test",
+        mode: "webchat",
+      },
+    });
+
+    registerAgentRunContext("run-auto-1", { sessionKey: "main" });
+
+    const finalChatP = onceMessage<{
+      type: "event";
+      event: string;
+      payload?: unknown;
+    }>(
+      ws,
+      (o) => {
+        if (o.type !== "event" || o.event !== "chat") return false;
+        const payload = o.payload as
+          | { state?: unknown; runId?: unknown }
+          | undefined;
+        return payload?.state === "final" && payload.runId === "run-auto-1";
+      },
+      8000,
+    );
+
+    emitAgentEvent({
+      runId: "run-auto-1",
+      stream: "assistant",
+      data: { text: "hi from agent" },
+    });
+    emitAgentEvent({
+      runId: "run-auto-1",
+      stream: "job",
+      data: { state: "done" },
+    });
+
+    const evt = await finalChatP;
+    const payload =
+      evt.payload && typeof evt.payload === "object"
+        ? (evt.payload as Record<string, unknown>)
+        : {};
+    expect(payload.sessionKey).toBe("main");
+    expect(payload.runId).toBe("run-auto-1");
+
+    ws.close();
+    await server.close();
+  });
+
   test("bridge chat.abort cancels while saving the session store", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-gw-"));
     testSessionStorePath = path.join(dir, "sessions.json");
@@ -3610,7 +3865,7 @@ describe("gateway server", () => {
             thinkingLevel: "low",
             verboseLevel: "on",
           },
-          "group:dev": {
+          "discord:group:dev": {
             sessionId: "sess-group",
             updatedAt: now - 120_000,
             totalTokens: 50,
@@ -3722,7 +3977,7 @@ describe("gateway server", () => {
     const deleted = await rpcReq<{ ok: true; deleted: boolean }>(
       ws,
       "sessions.delete",
-      { key: "group:dev" },
+      { key: "discord:group:dev" },
     );
     expect(deleted.ok).toBe(true);
     expect(deleted.payload?.deleted).toBe(true);
@@ -3731,7 +3986,9 @@ describe("gateway server", () => {
     }>(ws, "sessions.list", {});
     expect(listAfterDelete.ok).toBe(true);
     expect(
-      listAfterDelete.payload?.sessions.some((s) => s.key === "group:dev"),
+      listAfterDelete.payload?.sessions.some(
+        (s) => s.key === "discord:group:dev",
+      ),
     ).toBe(false);
     const filesAfterDelete = await fs.readdir(dir);
     expect(

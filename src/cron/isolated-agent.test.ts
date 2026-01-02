@@ -53,14 +53,19 @@ async function writeSessionStore(home: string) {
   return storePath;
 }
 
-function makeCfg(home: string, storePath: string): ClawdisConfig {
-  return {
+function makeCfg(
+  home: string,
+  storePath: string,
+  overrides: Partial<ClawdisConfig> = {},
+): ClawdisConfig {
+  const base: ClawdisConfig = {
     agent: {
       model: "anthropic/claude-opus-4-5",
       workspace: path.join(home, "clawd"),
     },
     session: { store: storePath, mainKey: "main" },
   } as ClawdisConfig;
+  return { ...base, ...overrides };
 }
 
 function makeJob(payload: CronJob["payload"]): CronJob {
@@ -92,6 +97,8 @@ describe("runCronIsolatedAgentTurn", () => {
         sendMessageTelegram: vi.fn(),
         sendMessageDiscord: vi.fn(),
         sendMessageMattermost: vi.fn(),
+        sendMessageSignal: vi.fn(),
+        sendMessageIMessage: vi.fn(),
       };
       vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
         payloads: [{ text: "first" }, { text: " " }, { text: " last " }],
@@ -123,6 +130,8 @@ describe("runCronIsolatedAgentTurn", () => {
         sendMessageTelegram: vi.fn(),
         sendMessageDiscord: vi.fn(),
         sendMessageMattermost: vi.fn(),
+        sendMessageSignal: vi.fn(),
+        sendMessageIMessage: vi.fn(),
       };
       const long = "a".repeat(2001);
       vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
@@ -155,6 +164,8 @@ describe("runCronIsolatedAgentTurn", () => {
         sendMessageTelegram: vi.fn(),
         sendMessageDiscord: vi.fn(),
         sendMessageMattermost: vi.fn(),
+        sendMessageSignal: vi.fn(),
+        sendMessageIMessage: vi.fn(),
       };
       vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
         payloads: [{ text: "hello" }],
@@ -194,6 +205,8 @@ describe("runCronIsolatedAgentTurn", () => {
         sendMessageTelegram: vi.fn(),
         sendMessageDiscord: vi.fn(),
         sendMessageMattermost: vi.fn(),
+        sendMessageSignal: vi.fn(),
+        sendMessageIMessage: vi.fn(),
       };
       vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
         payloads: [{ text: "hello" }],
@@ -224,6 +237,61 @@ describe("runCronIsolatedAgentTurn", () => {
     });
   });
 
+  it("passes telegram token from config for delivery", async () => {
+    await withTempHome(async (home) => {
+      const storePath = await writeSessionStore(home);
+      const deps: CliDeps = {
+        sendMessageWhatsApp: vi.fn(),
+        sendMessageTelegram: vi.fn().mockResolvedValue({
+          messageId: "t1",
+          chatId: "123",
+        }),
+        sendMessageDiscord: vi.fn(),
+        sendMessageSignal: vi.fn(),
+        sendMessageIMessage: vi.fn(),
+      };
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
+        payloads: [{ text: "hello from cron" }],
+        meta: {
+          durationMs: 5,
+          agentMeta: { sessionId: "s", provider: "p", model: "m" },
+        },
+      });
+
+      const prevTelegramToken = process.env.TELEGRAM_BOT_TOKEN;
+      process.env.TELEGRAM_BOT_TOKEN = "";
+      try {
+        const res = await runCronIsolatedAgentTurn({
+          cfg: makeCfg(home, storePath, { telegram: { botToken: "t-1" } }),
+          deps,
+          job: makeJob({
+            kind: "agentTurn",
+            message: "do it",
+            deliver: true,
+            channel: "telegram",
+            to: "123",
+          }),
+          message: "do it",
+          sessionKey: "cron:job-1",
+          lane: "cron",
+        });
+
+        expect(res.status).toBe("ok");
+        expect(deps.sendMessageTelegram).toHaveBeenCalledWith(
+          "123",
+          "hello from cron",
+          expect.objectContaining({ token: "t-1" }),
+        );
+      } finally {
+        if (prevTelegramToken === undefined) {
+          delete process.env.TELEGRAM_BOT_TOKEN;
+        } else {
+          process.env.TELEGRAM_BOT_TOKEN = prevTelegramToken;
+        }
+      }
+    });
+  });
+
   it("delivers via discord when configured", async () => {
     await withTempHome(async (home) => {
       const storePath = await writeSessionStore(home);
@@ -235,6 +303,8 @@ describe("runCronIsolatedAgentTurn", () => {
           channelId: "chan",
         }),
         sendMessageMattermost: vi.fn(),
+        sendMessageSignal: vi.fn(),
+        sendMessageIMessage: vi.fn(),
       };
       vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
         payloads: [{ text: "hello from cron" }],

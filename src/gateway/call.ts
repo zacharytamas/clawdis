@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { loadConfig } from "../config/config.js";
 import { GatewayClient } from "./client.js";
 import { PROTOCOL_VERSION } from "./protocol/index.js";
 
@@ -23,6 +24,32 @@ export async function callGateway<T = unknown>(
   opts: CallGatewayOptions,
 ): Promise<T> {
   const timeoutMs = opts.timeoutMs ?? 10_000;
+  const config = loadConfig();
+  const remote =
+    config.gateway?.mode === "remote" ? config.gateway.remote : undefined;
+  const url =
+    (typeof opts.url === "string" && opts.url.trim().length > 0
+      ? opts.url.trim()
+      : undefined) ||
+    (typeof remote?.url === "string" && remote.url.trim().length > 0
+      ? remote.url.trim()
+      : undefined) ||
+    "ws://127.0.0.1:18789";
+  const token =
+    (typeof opts.token === "string" && opts.token.trim().length > 0
+      ? opts.token.trim()
+      : undefined) ||
+    (typeof remote?.token === "string" && remote.token.trim().length > 0
+      ? remote.token.trim()
+      : undefined);
+  const password =
+    (typeof opts.password === "string" && opts.password.trim().length > 0
+      ? opts.password.trim()
+      : undefined) ||
+    process.env.CLAWDIS_GATEWAY_PASSWORD ||
+    (typeof remote?.password === "string" && remote.password.trim().length > 0
+      ? remote.password.trim()
+      : undefined);
   return await new Promise<T>((resolve, reject) => {
     let settled = false;
     let ignoreClose = false;
@@ -35,9 +62,9 @@ export async function callGateway<T = unknown>(
     };
 
     const client = new GatewayClient({
-      url: opts.url,
-      token: opts.token,
-      password: opts.password,
+      url,
+      token,
+      password,
       instanceId: opts.instanceId ?? randomUUID(),
       clientName: opts.clientName ?? "cli",
       clientVersion: opts.clientVersion ?? "dev",

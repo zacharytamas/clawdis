@@ -297,15 +297,30 @@ extension OnboardingView {
             self.onboardingCard(spacing: 12, padding: 16) {
                 HStack(alignment: .center, spacing: 10) {
                     Circle()
-                        .fill(self.anthropicAuthConnected ? Color.green : Color.orange)
+                        .fill(self.anthropicAuthVerified ? Color.green : Color.orange)
                         .frame(width: 10, height: 10)
-                    Text(self.anthropicAuthConnected ? "Claude connected (OAuth)" : "Not connected yet")
+                    Text(
+                        self.anthropicAuthConnected
+                            ? (self.anthropicAuthVerified
+                                ? "Claude connected (OAuth) — verified"
+                                : "Claude connected (OAuth)")
+                            : "Not connected yet")
                         .font(.headline)
                     Spacer()
                 }
 
-                if !self.anthropicAuthConnected {
+                if self.anthropicAuthConnected, self.anthropicAuthVerifying {
+                    Text("Verifying OAuth…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if !self.anthropicAuthConnected {
                     Text(self.anthropicAuthDetectedStatus.shortDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if self.anthropicAuthVerified, let date = self.anthropicAuthVerifiedAt {
+                    Text("Detected working OAuth (\(date.formatted(date: .abbreviated, time: .shortened))).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -313,7 +328,7 @@ extension OnboardingView {
 
                 Text(
                     "This lets Clawdis use Claude immediately. Credentials are stored at " +
-                        "`~/.clawdis/credentials/oauth.json` (owner-only). You can redo this anytime.")
+                        "`~/.clawdis/credentials/oauth.json` (owner-only).")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -341,20 +356,38 @@ extension OnboardingView {
                 Divider().padding(.vertical, 2)
 
                 HStack(spacing: 12) {
-                    Button {
-                        self.startAnthropicOAuth()
-                    } label: {
-                        if self.anthropicAuthBusy {
-                            ProgressView()
+                    if !self.anthropicAuthVerified {
+                        if self.anthropicAuthConnected {
+                            Button("Verify") {
+                                Task { await self.verifyAnthropicOAuthIfNeeded(force: true) }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(self.anthropicAuthBusy || self.anthropicAuthVerifying)
+
+                            if self.anthropicAuthVerificationFailed {
+                                Button("Re-auth (OAuth)") {
+                                    self.startAnthropicOAuth()
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(self.anthropicAuthBusy || self.anthropicAuthVerifying)
+                            }
                         } else {
-                            Text("Open Claude sign-in (OAuth)")
+                            Button {
+                                self.startAnthropicOAuth()
+                            } label: {
+                                if self.anthropicAuthBusy {
+                                    ProgressView()
+                                } else {
+                                    Text("Open Claude sign-in (OAuth)")
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(self.anthropicAuthBusy)
                         }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(self.anthropicAuthBusy)
                 }
 
-                if self.anthropicAuthPKCE != nil {
+                if !self.anthropicAuthVerified, self.anthropicAuthPKCE != nil {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Paste the `code#state` value")
                             .font(.headline)
@@ -405,6 +438,7 @@ extension OnboardingView {
                 }
             }
         }
+        .task { await self.verifyAnthropicOAuthIfNeeded() }
     }
 
     func permissionsPage() -> some View {
@@ -564,9 +598,14 @@ extension OnboardingView {
                             .disabled(self.workspaceApplying)
 
                             Button("Save in config") {
-                                let url = AgentWorkspace.resolveWorkspaceURL(from: self.workspacePath)
-                                ClawdisConfigFile.setAgentWorkspace(AgentWorkspace.displayPath(for: url))
-                                self.workspaceStatus = "Saved to ~/.clawdis/clawdis.json (agent.workspace)"
+                                Task {
+                                    let url = AgentWorkspace.resolveWorkspaceURL(from: self.workspacePath)
+                                    let saved = await self.saveAgentWorkspace(AgentWorkspace.displayPath(for: url))
+                                    if saved {
+                                        self.workspaceStatus =
+                                            "Saved to ~/.clawdis/clawdis.json (agent.workspace)"
+                                    }
+                                }
                             }
                             .buttonStyle(.bordered)
                             .disabled(self.workspaceApplying)
@@ -666,10 +705,88 @@ extension OnboardingView {
                 {
                     self.openSettings(tab: .skills)
                 }
+                self.skillsOverview
                 Toggle("Launch at login", isOn: self.$state.launchAtLogin)
                     .onChange(of: self.state.launchAtLogin) { _, newValue in
                         AppStateStore.updateLaunchAtLogin(enabled: newValue)
                     }
+            }
+        }
+        .task { await self.maybeLoadOnboardingSkills() }
+    }
+
+    private func maybeLoadOnboardingSkills() async {
+        guard !self.didLoadOnboardingSkills else { return }
+        self.didLoadOnboardingSkills = true
+        await self.onboardingSkillsModel.refresh()
+    }
+
+    private var skillsOverview: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+                .padding(.vertical, 6)
+
+            HStack(spacing: 10) {
+                Text("Skills included")
+                    .font(.headline)
+                Spacer(minLength: 0)
+                if self.onboardingSkillsModel.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Button("Refresh") {
+                        Task { await self.onboardingSkillsModel.refresh() }
+                    }
+                    .buttonStyle(.link)
+                }
+            }
+
+            if let error = self.onboardingSkillsModel.error {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Couldn’t load skills from the Gateway.")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.orange)
+                    Text(
+                        "Make sure the Gateway is running and connected, " +
+                            "then hit Refresh (or open Settings → Skills).")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Details: \(error)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else if self.onboardingSkillsModel.skills.isEmpty {
+                Text("No skills reported yet.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(self.onboardingSkillsModel.skills) { skill in
+                            HStack(alignment: .top, spacing: 10) {
+                                Text(skill.emoji ?? "✨")
+                                    .font(.callout)
+                                    .frame(width: 22, alignment: .leading)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(skill.name)
+                                        .font(.callout.weight(.semibold))
+                                    Text(skill.description)
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color(NSColor.windowBackgroundColor)))
+                }
+                .frame(maxHeight: 160)
             }
         }
     }

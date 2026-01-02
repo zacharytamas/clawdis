@@ -213,6 +213,7 @@ export function renderApp(state: AppViewState) {
               onPasswordChange: (next) => (state.password = next),
               onSessionKeyChange: (next) => {
                 state.sessionKey = next;
+                state.chatMessage = "";
                 state.applySettings({ ...state.settings, sessionKey: next });
               },
               onRefresh: () => state.loadOverview(),
@@ -323,7 +324,11 @@ export function renderApp(state: AppViewState) {
               sessionKey: state.sessionKey,
               onSessionKeyChange: (next) => {
                 state.sessionKey = next;
+                state.chatMessage = "";
+                state.chatStream = null;
+                state.chatRunId = null;
                 state.applySettings({ ...state.settings, sessionKey: next });
+                void loadChatHistory(state);
               },
               thinkingLevel: state.chatThinkingLevel,
               loading: state.chatLoading,
@@ -334,6 +339,7 @@ export function renderApp(state: AppViewState) {
               connected: state.connected,
               canSend: state.connected && hasConnectedMobileNode,
               disabledReason: chatDisabledReason,
+              sessions: state.sessionsResult,
               onRefresh: () => loadChatHistory(state),
               onDraftChange: (next) => (state.chatMessage = next),
               onSend: () => state.handleSendChat(),

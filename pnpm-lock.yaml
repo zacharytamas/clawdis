@@ -4,15 +4,24 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@sinclair/typebox': 0.34.45
+
 patchedDependencies:
   '@mariozechner/pi-ai':
     hash: bf3e904ebaad236b8c3bb48c7d1150a1463735e783acaab6d15d6cd381b43832
     path: patches/@mariozechner__pi-ai.patch
+  '@mariozechner/pi-coding-agent@0.30.2':
+    hash: d0d5ffa1bfda8a0f9d14a5e73a074014346d3edbdb2ffc91444d3be5119f5745
+    path: patches/@mariozechner__pi-coding-agent@0.30.2.patch
 
 importers:
 
   .:
     dependencies:
+      '@clack/prompts':
+        specifier: ^0.11.0
+        version: 0.11.0
       '@grammyjs/transformer-throttler':
         specifier: ^1.2.1
         version: 1.2.1(grammy@1.38.4)
@@ -27,9 +36,9 @@ importers:
         version: 0.30.2(patch_hash=bf3e904ebaad236b8c3bb48c7d1150a1463735e783acaab6d15d6cd381b43832)(ws@8.18.3)(zod@4.2.1)
       '@mariozechner/pi-coding-agent':
         specifier: ^0.30.2
-        version: 0.30.2(ws@8.18.3)(zod@4.2.1)
+        version: 0.30.2(patch_hash=d0d5ffa1bfda8a0f9d14a5e73a074014346d3edbdb2ffc91444d3be5119f5745)(ws@8.18.3)(zod@4.2.1)
       '@sinclair/typebox':
-        specifier: ^0.34.45
+        specifier: 0.34.45
         version: 0.34.45
       '@whiskeysockets/baileys':
         specifier: 7.0.0-rc.9
@@ -310,6 +319,12 @@ packages:
 
   '@cacheable/utils@2.3.3':
     resolution: {integrity: sha512-JsXDL70gQ+1Vc2W/KUFfkAJzgb4puKwwKehNLuB+HrNKWf91O736kGfxn4KujXCCSuh6mRRL4XEB0PkAFjWS0A==}
+
+  '@clack/core@0.5.0':
+    resolution: {integrity: sha512-p3y0FIOwaYRUPRcMO7+dlmLh8PSRcrjuTndsiA0WAFbWES0mLZlrjVoBRZ9DzkPFJZG6KGkJmoEAY0ZcVWTkow==}
+
+  '@clack/prompts@0.11.0':
+    resolution: {integrity: sha512-pMN5FcrEw9hUkZA4f+zLlzivQSeQf5dRGJjSUbvVYDLvpKCdQx5OaknvKzgbtXOizhP+SJJJjqEbOe55uKKfAw==}
 
   '@discordjs/builders@1.13.1':
     resolution: {integrity: sha512-cOU0UDHc3lp/5nKByDxkmRiNZBpdp0kx55aarbiAfakfKJHlxv/yFW1zmIqCAmwH5CRlrH9iMFKJMpvW4DPB+w==}
@@ -2628,6 +2643,9 @@ packages:
     resolution: {integrity: sha512-2wcC/oGxHis/BoHkkPwldgiPSYcpZK3JU28WoMVv55yHJgcZ8rlXvuG9iZggz+sU1d4bRgIGASwyWqjxu3FM0g==}
     engines: {node: '>=18'}
 
+  sisteransi@1.0.5:
+    resolution: {integrity: sha512-bLGGlR1QxBcynn2d5YmDX4MGjlZvy2MRBDRNHLJ8VI6l6+9FUiyTFNJ0IveOSP0bcXgVDPRcfGqA0pjaqUpfVg==}
+
   sonic-boom@4.2.0:
     resolution: {integrity: sha512-INb7TM37/mAcsGmc9hyyI6+QR3rR1zVRu36B0NeGXKnOOLiZOfER5SA+N7X7k3yUYRzLWafduTDvJAfDswwEww==}
 
@@ -3106,6 +3124,17 @@ snapshots:
       hashery: 1.3.0
       keyv: 5.5.5
 
+  '@clack/core@0.5.0':
+    dependencies:
+      picocolors: 1.1.1
+      sisteransi: 1.0.5
+
+  '@clack/prompts@0.11.0':
+    dependencies:
+      '@clack/core': 0.5.0
+      picocolors: 1.1.1
+      sisteransi: 1.0.5
+
   '@discordjs/builders@1.13.1':
     dependencies:
       '@discordjs/formatters': 0.6.2
@@ -3477,7 +3506,7 @@ snapshots:
       - ws
       - zod
 
-  '@mariozechner/pi-coding-agent@0.30.2(ws@8.18.3)(zod@4.2.1)':
+  '@mariozechner/pi-coding-agent@0.30.2(patch_hash=d0d5ffa1bfda8a0f9d14a5e73a074014346d3edbdb2ffc91444d3be5119f5745)(ws@8.18.3)(zod@4.2.1)':
     dependencies:
       '@mariozechner/pi-agent-core': 0.30.2(ws@8.18.3)(zod@4.2.1)
       '@mariozechner/pi-ai': 0.30.2(patch_hash=bf3e904ebaad236b8c3bb48c7d1150a1463735e783acaab6d15d6cd381b43832)(ws@8.18.3)(zod@4.2.1)
@@ -5499,6 +5528,8 @@ snapshots:
       '@polka/url': 1.0.0-next.29
       mrmime: 2.0.1
       totalist: 3.0.1
+
+  sisteransi@1.0.5: {}
 
   sonic-boom@4.2.0:
     dependencies:

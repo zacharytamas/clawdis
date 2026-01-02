@@ -1,11 +1,15 @@
 import chalk from "chalk";
 import { Command } from "commander";
 import { agentCommand } from "../commands/agent.js";
+import { configureCommand } from "../commands/configure.js";
+import { doctorCommand } from "../commands/doctor.js";
 import { healthCommand } from "../commands/health.js";
+import { onboardCommand } from "../commands/onboard.js";
 import { sendCommand } from "../commands/send.js";
 import { sessionsCommand } from "../commands/sessions.js";
 import { setupCommand } from "../commands/setup.js";
 import { statusCommand } from "../commands/status.js";
+import { updateCommand } from "../commands/update.js";
 import { danger, setVerbose } from "../globals.js";
 import { loginWeb, logoutWeb } from "../provider-web.js";
 import { defaultRuntime } from "../runtime.js";
@@ -105,12 +109,141 @@ export function buildProgram() {
       "--workspace <dir>",
       "Agent workspace directory (default: ~/clawd; stored as agent.workspace)",
     )
+    .option("--wizard", "Run the interactive onboarding wizard", false)
+    .option("--non-interactive", "Run the wizard without prompts", false)
+    .option("--mode <mode>", "Wizard mode: local|remote")
+    .option("--remote-url <url>", "Remote Gateway WebSocket URL")
+    .option("--remote-token <token>", "Remote Gateway token (optional)")
     .action(async (opts) => {
       try {
+        if (opts.wizard) {
+          await onboardCommand(
+            {
+              workspace: opts.workspace as string | undefined,
+              nonInteractive: Boolean(opts.nonInteractive),
+              mode: opts.mode as "local" | "remote" | undefined,
+              remoteUrl: opts.remoteUrl as string | undefined,
+              remoteToken: opts.remoteToken as string | undefined,
+            },
+            defaultRuntime,
+          );
+          return;
+        }
         await setupCommand(
           { workspace: opts.workspace as string | undefined },
           defaultRuntime,
         );
+      } catch (err) {
+        defaultRuntime.error(String(err));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  program
+    .command("onboard")
+    .description(
+      "Interactive wizard to set up the gateway, workspace, and skills",
+    )
+    .option("--workspace <dir>", "Agent workspace directory (default: ~/clawd)")
+    .option("--non-interactive", "Run without prompts", false)
+    .option("--mode <mode>", "Wizard mode: local|remote")
+    .option("--auth-choice <choice>", "Auth: oauth|apiKey|minimax|skip")
+    .option("--anthropic-api-key <key>", "Anthropic API key")
+    .option("--gateway-port <port>", "Gateway port", "18789")
+    .option("--gateway-bind <mode>", "Gateway bind: loopback|lan|tailnet|auto")
+    .option("--gateway-auth <mode>", "Gateway auth: off|token|password")
+    .option("--gateway-token <token>", "Gateway token (token auth)")
+    .option("--gateway-password <password>", "Gateway password (password auth)")
+    .option("--remote-url <url>", "Remote Gateway WebSocket URL")
+    .option("--remote-token <token>", "Remote Gateway token (optional)")
+    .option("--tailscale <mode>", "Tailscale: off|serve|funnel")
+    .option("--tailscale-reset-on-exit", "Reset tailscale serve/funnel on exit")
+    .option("--install-daemon", "Install gateway daemon")
+    .option("--skip-skills", "Skip skills setup")
+    .option("--skip-health", "Skip health check")
+    .option("--node-manager <name>", "Node manager for skills: npm|pnpm|bun")
+    .option("--json", "Output JSON summary", false)
+    .action(async (opts) => {
+      try {
+        await onboardCommand(
+          {
+            workspace: opts.workspace as string | undefined,
+            nonInteractive: Boolean(opts.nonInteractive),
+            mode: opts.mode as "local" | "remote" | undefined,
+            authChoice: opts.authChoice as
+              | "oauth"
+              | "apiKey"
+              | "minimax"
+              | "skip"
+              | undefined,
+            anthropicApiKey: opts.anthropicApiKey as string | undefined,
+            gatewayPort: Number.parseInt(
+              String(opts.gatewayPort ?? "18789"),
+              10,
+            ),
+            gatewayBind: opts.gatewayBind as
+              | "loopback"
+              | "lan"
+              | "tailnet"
+              | "auto"
+              | undefined,
+            gatewayAuth: opts.gatewayAuth as
+              | "off"
+              | "token"
+              | "password"
+              | undefined,
+            gatewayToken: opts.gatewayToken as string | undefined,
+            gatewayPassword: opts.gatewayPassword as string | undefined,
+            remoteUrl: opts.remoteUrl as string | undefined,
+            remoteToken: opts.remoteToken as string | undefined,
+            tailscale: opts.tailscale as "off" | "serve" | "funnel" | undefined,
+            tailscaleResetOnExit: Boolean(opts.tailscaleResetOnExit),
+            installDaemon: Boolean(opts.installDaemon),
+            skipSkills: Boolean(opts.skipSkills),
+            skipHealth: Boolean(opts.skipHealth),
+            nodeManager: opts.nodeManager as "npm" | "pnpm" | "bun" | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      } catch (err) {
+        defaultRuntime.error(String(err));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  program
+    .command("configure")
+    .description(
+      "Interactive wizard to update models, providers, skills, and gateway",
+    )
+    .action(async () => {
+      try {
+        await configureCommand(defaultRuntime);
+      } catch (err) {
+        defaultRuntime.error(String(err));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  program
+    .command("doctor")
+    .description("Health checks + quick fixes for the gateway and providers")
+    .action(async () => {
+      try {
+        await doctorCommand(defaultRuntime);
+      } catch (err) {
+        defaultRuntime.error(String(err));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  program
+    .command("update")
+    .description("Audit and modernize the local configuration")
+    .action(async () => {
+      try {
+        await updateCommand(defaultRuntime);
       } catch (err) {
         defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
@@ -154,7 +287,7 @@ export function buildProgram() {
     )
     .requiredOption(
       "-t, --to <number>",
-      "Recipient: E.164 for WhatsApp, Telegram chat id/@username, Discord channel/user, or Mattermost user/channel",
+      "Recipient: E.164 for WhatsApp/Signal, Telegram chat id/@username, Discord channel/user, Mattermost user/channel, or iMessage handle/chat_id",
     )
     .requiredOption("-m, --message <text>", "Message body")
     .option(
@@ -163,7 +296,7 @@ export function buildProgram() {
     )
     .option(
       "--provider <provider>",
-      "Delivery provider: whatsapp|telegram|discord|mattermost (default: whatsapp)",
+      "Delivery provider: whatsapp|telegram|discord|mattermost|signal|imessage (default: whatsapp)",
     )
     .option("--dry-run", "Print payload and skip sending", false)
     .option("--json", "Output result as JSON", false)
@@ -206,7 +339,7 @@ Examples:
     .option("--verbose <on|off>", "Persist agent verbose level for the session")
     .option(
       "--provider <provider>",
-      "Delivery provider: whatsapp|telegram|discord|mattermost (default: whatsapp)",
+      "Delivery provider: whatsapp|telegram|discord|mattermost|signal|imessage (default: whatsapp)",
     )
     .option(
       "--deliver",
@@ -255,7 +388,7 @@ Examples:
     .option("--json", "Output JSON instead of text", false)
     .option(
       "--deep",
-      "Probe providers (WhatsApp Web + Telegram + Discord)",
+      "Probe providers (WhatsApp Web + Telegram + Discord + Signal)",
       false,
     )
     .option("--timeout <ms>", "Probe timeout in milliseconds", "10000")
@@ -266,7 +399,7 @@ Examples:
 Examples:
   clawdis status                   # show linked account + session store summary
   clawdis status --json            # machine-readable output
-  clawdis status --deep            # run provider probes (WA + Telegram + Discord)
+  clawdis status --deep            # run provider probes (WA + Telegram + Discord + Signal)
   clawdis status --deep --timeout 5000 # tighten probe timeout`,
     )
     .action(async (opts) => {
