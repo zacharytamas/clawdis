@@ -624,16 +624,10 @@ export async function agentCommand(
 
     if (deliveryProvider === "mattermost" && mattermostTarget) {
       try {
-        if (media.length > 0 && !text) {
-          await deps.sendMessageMattermost(
-            mattermostTarget,
-            "Media omitted (Mattermost uploads not configured).",
-          );
-          continue;
-        }
-        if (text) {
-          await deps.sendMessageMattermost(mattermostTarget, text);
-        }
+        if (!text && media.length === 0) continue;
+        await deps.sendMessageMattermost(mattermostTarget, text, {
+          mediaUrls: media,
+        });
       } catch (err) {
         if (!bestEffortDeliver) throw err;
         logDeliveryError(err);

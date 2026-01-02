@@ -67,7 +67,10 @@ export function createMattermostClient(
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${auth.token}`);
     headers.set("Accept", "application/json");
-    if (init.body && !headers.has("Content-Type")) {
+    const body = init.body;
+    const isFormData =
+      typeof FormData !== "undefined" && body instanceof FormData;
+    if (body && !isFormData && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
     const res = await fetcher(url, { ...init, headers });

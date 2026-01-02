@@ -451,12 +451,11 @@ export async function runCronIsolatedAgentTurn(params: {
         for (const payload of payloads) {
           const mediaList =
             payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
-          let text = payload.text ?? "";
-          if (!text && mediaList.length > 0) {
-            text = "Media omitted (Mattermost uploads not configured).";
-          }
-          if (!text.trim()) continue;
-          await params.deps.sendMessageMattermost(target, text);
+          const text = payload.text ?? "";
+          if (!text.trim() && mediaList.length === 0) continue;
+          await params.deps.sendMessageMattermost(target, text, {
+            mediaUrls: mediaList,
+          });
         }
       } catch (err) {
         if (!bestEffortDeliver)

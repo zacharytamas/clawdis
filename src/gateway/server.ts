@@ -6607,7 +6607,9 @@ export async function startGatewayServer(
                   });
                   respond(true, payload, undefined, { provider });
                 } else if (provider === "mattermost") {
-                  const result = await sendMessageMattermost(to, message);
+                  const result = await sendMessageMattermost(to, message, {
+                    mediaUrl: params.mediaUrl,
+                  });
                   const payload = {
                     runId: idem,
                     postId: result.postId,

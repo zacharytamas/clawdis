@@ -86,7 +86,9 @@ export async function sendCommand(
   }
 
   if (provider === "mattermost") {
-    const result = await deps.sendMessageMattermost(opts.to, opts.message);
+    const result = await deps.sendMessageMattermost(opts.to, opts.message, {
+      mediaUrl: opts.media,
+    });
     runtime.log(
       success(
         `✅ Sent via mattermost. Post ID: ${result.postId} (channel ${result.channelId})`,

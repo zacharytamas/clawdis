@@ -394,14 +394,8 @@ async function deliverHeartbeatReply(params: {
     return;
   }
 
-  if (mediaUrls.length > 0) {
-    await deps.sendMattermost(
-      to,
-      text || "Media omitted (Mattermost uploads not configured).",
-    );
-    return;
-  }
-  await deps.sendMattermost(to, text);
+  if (!text.trim() && mediaUrls.length === 0) return;
+  await deps.sendMattermost(to, text, { mediaUrls });
 }
 
 export async function runHeartbeatOnce(opts: {

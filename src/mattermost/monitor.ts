@@ -60,9 +60,6 @@ export type MonitorMattermostOpts = {
   fetchImpl?: typeof fetch;
 };
 
-const MEDIA_UNSUPPORTED_TEXT =
-  "Media omitted (Mattermost uploads not configured).";
-
 function normalizeAllowList(raw?: Array<string | number>): AllowList | null {
   if (!raw || raw.length === 0) return null;
   const ids = new Set<string>();
@@ -149,20 +146,13 @@ async function deliverReplies(params: {
   for (const reply of replies) {
     const mediaList =
       reply.mediaUrls ?? (reply.mediaUrl ? [reply.mediaUrl] : []);
-    let text = reply.text ?? "";
-    if (!text && mediaList.length > 0) {
-      text = MEDIA_UNSUPPORTED_TEXT;
-    }
-    if (!text.trim()) continue;
-    if (mediaList.length > 0 && isVerbose()) {
-      logVerbose(
-        `mattermost reply had media; sending text-only to channel ${channelId}`,
-      );
-    }
+    const text = reply.text ?? "";
+    if (!text.trim() && mediaList.length === 0) continue;
     await sendMessageMattermost(`channel:${channelId}`, text, {
       baseUrl,
       token,
       fetchImpl,
+      mediaUrls: mediaList,
     });
     runtime.log?.(`mattermost: delivered reply to channel ${channelId}`);
   }
