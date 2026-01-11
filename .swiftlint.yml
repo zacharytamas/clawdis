@@ -17,6 +17,8 @@ excluded:
   - dist
   - coverage
   - "*.playground"
+  # Generated (protocol-gen-swift.ts)
+  - apps/macos/Sources/ClawdbotProtocol/GatewayModels.swift
 
 analyzer_rules:
   - unused_declaration
@@ -107,6 +109,10 @@ type_name:
 function_body_length:
   warning: 150
   error: 300
+
+function_parameter_count:
+  warning: 7
+  error: 10
 
 file_length:
   warning: 1500

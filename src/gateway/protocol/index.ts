@@ -3,14 +3,28 @@ import {
   type AgentEvent,
   AgentEventSchema,
   AgentParamsSchema,
+  type AgentSummary,
+  AgentSummarySchema,
+  type AgentsListParams,
+  AgentsListParamsSchema,
+  type AgentsListResult,
+  AgentsListResultSchema,
+  type AgentWaitParams,
+  AgentWaitParamsSchema,
   type ChatAbortParams,
   ChatAbortParamsSchema,
   type ChatEvent,
   ChatEventSchema,
   ChatHistoryParamsSchema,
   ChatSendParamsSchema,
+  type ConfigApplyParams,
+  ConfigApplyParamsSchema,
   type ConfigGetParams,
   ConfigGetParamsSchema,
+  type ConfigSchemaParams,
+  ConfigSchemaParamsSchema,
+  type ConfigSchemaResponse,
+  ConfigSchemaResponseSchema,
   type ConfigSetParams,
   ConfigSetParamsSchema,
   type ConnectParams,
@@ -42,6 +56,10 @@ import {
   GatewayFrameSchema,
   type HelloOk,
   HelloOkSchema,
+  type LogsTailParams,
+  LogsTailParamsSchema,
+  type LogsTailResult,
+  LogsTailResultSchema,
   type ModelsListParams,
   ModelsListParamsSchema,
   type NodeDescribeParams,
@@ -62,12 +80,18 @@ import {
   NodePairVerifyParamsSchema,
   type NodeRenameParams,
   NodeRenameParamsSchema,
+  type PollParams,
+  PollParamsSchema,
   PROTOCOL_VERSION,
   type PresenceEntry,
   PresenceEntrySchema,
   ProtocolSchemas,
+  type ProvidersLogoutParams,
+  ProvidersLogoutParamsSchema,
   type ProvidersStatusParams,
   ProvidersStatusParamsSchema,
+  type ProvidersStatusResult,
+  ProvidersStatusResultSchema,
   type RequestFrame,
   RequestFrameSchema,
   type ResponseFrame,
@@ -83,6 +107,8 @@ import {
   SessionsPatchParamsSchema,
   type SessionsResetParams,
   SessionsResetParamsSchema,
+  type SessionsResolveParams,
+  SessionsResolveParamsSchema,
   type ShutdownEvent,
   ShutdownEventSchema,
   type SkillsInstallParams,
@@ -99,12 +125,30 @@ import {
   TalkModeParamsSchema,
   type TickEvent,
   TickEventSchema,
+  type UpdateRunParams,
+  UpdateRunParamsSchema,
   type WakeParams,
   WakeParamsSchema,
   type WebLoginStartParams,
   WebLoginStartParamsSchema,
   type WebLoginWaitParams,
   WebLoginWaitParamsSchema,
+  type WizardCancelParams,
+  WizardCancelParamsSchema,
+  type WizardNextParams,
+  WizardNextParamsSchema,
+  type WizardNextResult,
+  WizardNextResultSchema,
+  type WizardStartParams,
+  WizardStartParamsSchema,
+  type WizardStartResult,
+  WizardStartResultSchema,
+  type WizardStatusParams,
+  WizardStatusParamsSchema,
+  type WizardStatusResult,
+  WizardStatusResultSchema,
+  type WizardStep,
+  WizardStepSchema,
 } from "./schema.js";
 
 const ajv = new (
@@ -121,9 +165,19 @@ export const validateConnectParams =
   ajv.compile<ConnectParams>(ConnectParamsSchema);
 export const validateRequestFrame =
   ajv.compile<RequestFrame>(RequestFrameSchema);
+export const validateResponseFrame =
+  ajv.compile<ResponseFrame>(ResponseFrameSchema);
+export const validateEventFrame = ajv.compile<EventFrame>(EventFrameSchema);
 export const validateSendParams = ajv.compile(SendParamsSchema);
+export const validatePollParams = ajv.compile<PollParams>(PollParamsSchema);
 export const validateAgentParams = ajv.compile(AgentParamsSchema);
+export const validateAgentWaitParams = ajv.compile<AgentWaitParams>(
+  AgentWaitParamsSchema,
+);
 export const validateWakeParams = ajv.compile<WakeParams>(WakeParamsSchema);
+export const validateAgentsListParams = ajv.compile<AgentsListParams>(
+  AgentsListParamsSchema,
+);
 export const validateNodePairRequestParams = ajv.compile<NodePairRequestParams>(
   NodePairRequestParamsSchema,
 );
@@ -153,6 +207,9 @@ export const validateNodeInvokeParams = ajv.compile<NodeInvokeParams>(
 export const validateSessionsListParams = ajv.compile<SessionsListParams>(
   SessionsListParamsSchema,
 );
+export const validateSessionsResolveParams = ajv.compile<SessionsResolveParams>(
+  SessionsResolveParamsSchema,
+);
 export const validateSessionsPatchParams = ajv.compile<SessionsPatchParams>(
   SessionsPatchParamsSchema,
 );
@@ -171,10 +228,31 @@ export const validateConfigGetParams = ajv.compile<ConfigGetParams>(
 export const validateConfigSetParams = ajv.compile<ConfigSetParams>(
   ConfigSetParamsSchema,
 );
+export const validateConfigApplyParams = ajv.compile<ConfigApplyParams>(
+  ConfigApplyParamsSchema,
+);
+export const validateConfigSchemaParams = ajv.compile<ConfigSchemaParams>(
+  ConfigSchemaParamsSchema,
+);
+export const validateWizardStartParams = ajv.compile<WizardStartParams>(
+  WizardStartParamsSchema,
+);
+export const validateWizardNextParams = ajv.compile<WizardNextParams>(
+  WizardNextParamsSchema,
+);
+export const validateWizardCancelParams = ajv.compile<WizardCancelParams>(
+  WizardCancelParamsSchema,
+);
+export const validateWizardStatusParams = ajv.compile<WizardStatusParams>(
+  WizardStatusParamsSchema,
+);
 export const validateTalkModeParams =
   ajv.compile<TalkModeParams>(TalkModeParamsSchema);
 export const validateProvidersStatusParams = ajv.compile<ProvidersStatusParams>(
   ProvidersStatusParamsSchema,
+);
+export const validateProvidersLogoutParams = ajv.compile<ProvidersLogoutParams>(
+  ProvidersLogoutParamsSchema,
 );
 export const validateModelsListParams = ajv.compile<ModelsListParams>(
   ModelsListParamsSchema,
@@ -205,12 +283,17 @@ export const validateCronRunParams =
   ajv.compile<CronRunParams>(CronRunParamsSchema);
 export const validateCronRunsParams =
   ajv.compile<CronRunsParams>(CronRunsParamsSchema);
+export const validateLogsTailParams =
+  ajv.compile<LogsTailParams>(LogsTailParamsSchema);
 export const validateChatHistoryParams = ajv.compile(ChatHistoryParamsSchema);
 export const validateChatSendParams = ajv.compile(ChatSendParamsSchema);
 export const validateChatAbortParams = ajv.compile<ChatAbortParams>(
   ChatAbortParamsSchema,
 );
 export const validateChatEvent = ajv.compile(ChatEventSchema);
+export const validateUpdateRunParams = ajv.compile<UpdateRunParams>(
+  UpdateRunParamsSchema,
+);
 export const validateWebLoginStartParams = ajv.compile<WebLoginStartParams>(
   WebLoginStartParamsSchema,
 );
@@ -239,6 +322,7 @@ export {
   AgentEventSchema,
   ChatEventSchema,
   SendParamsSchema,
+  PollParamsSchema,
   AgentParamsSchema,
   WakeParamsSchema,
   NodePairRequestParamsSchema,
@@ -255,9 +339,25 @@ export {
   SessionsCompactParamsSchema,
   ConfigGetParamsSchema,
   ConfigSetParamsSchema,
+  ConfigApplyParamsSchema,
+  ConfigSchemaParamsSchema,
+  ConfigSchemaResponseSchema,
+  WizardStartParamsSchema,
+  WizardNextParamsSchema,
+  WizardCancelParamsSchema,
+  WizardStatusParamsSchema,
+  WizardStepSchema,
+  WizardNextResultSchema,
+  WizardStartResultSchema,
+  WizardStatusResultSchema,
   ProvidersStatusParamsSchema,
+  ProvidersStatusResultSchema,
+  ProvidersLogoutParamsSchema,
   WebLoginStartParamsSchema,
   WebLoginWaitParamsSchema,
+  AgentSummarySchema,
+  AgentsListParamsSchema,
+  AgentsListResultSchema,
   ModelsListParamsSchema,
   SkillsStatusParamsSchema,
   SkillsInstallParamsSchema,
@@ -270,8 +370,11 @@ export {
   CronRemoveParamsSchema,
   CronRunParamsSchema,
   CronRunsParamsSchema,
+  LogsTailParamsSchema,
+  LogsTailResultSchema,
   ChatHistoryParamsSchema,
   ChatSendParamsSchema,
+  UpdateRunParamsSchema,
   TickEventSchema,
   ShutdownEventSchema,
   ProtocolSchemas,
@@ -292,6 +395,7 @@ export type {
   ErrorShape,
   StateVersion,
   AgentEvent,
+  AgentWaitParams,
   ChatEvent,
   TickEvent,
   ShutdownEvent,
@@ -301,10 +405,26 @@ export type {
   NodePairApproveParams,
   ConfigGetParams,
   ConfigSetParams,
+  ConfigApplyParams,
+  ConfigSchemaParams,
+  ConfigSchemaResponse,
+  WizardStartParams,
+  WizardNextParams,
+  WizardCancelParams,
+  WizardStatusParams,
+  WizardStep,
+  WizardNextResult,
+  WizardStartResult,
+  WizardStatusResult,
   TalkModeParams,
   ProvidersStatusParams,
+  ProvidersStatusResult,
+  ProvidersLogoutParams,
   WebLoginStartParams,
   WebLoginWaitParams,
+  AgentSummary,
+  AgentsListParams,
+  AgentsListResult,
   SkillsStatusParams,
   SkillsInstallParams,
   SkillsUpdateParams,
@@ -313,6 +433,7 @@ export type {
   NodeListParams,
   NodeInvokeParams,
   SessionsListParams,
+  SessionsResolveParams,
   SessionsPatchParams,
   SessionsResetParams,
   SessionsDeleteParams,
@@ -326,4 +447,8 @@ export type {
   CronRunParams,
   CronRunsParams,
   CronRunLogEntry,
+  LogsTailParams,
+  LogsTailResult,
+  PollParams,
+  UpdateRunParams,
 };

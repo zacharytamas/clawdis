@@ -1,4 +1,4 @@
-import type { AgentToolResult } from "@mariozechner/pi-ai";
+import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 
 import { getImageMetadata, resizeToJpeg } from "../media/image-ops.js";
 
@@ -6,7 +6,7 @@ type ToolContentBlock = AgentToolResult<unknown>["content"][number];
 type ImageContentBlock = Extract<ToolContentBlock, { type: "image" }>;
 type TextContentBlock = Extract<ToolContentBlock, { type: "text" }>;
 
-// Anthropic Messages API limitations (observed in Clawdis sessions):
+// Anthropic Messages API limitations (observed in Clawdbot sessions):
 // - Images over ~2000px per side can fail in multi-image requests.
 // - Images over 5MB are rejected by the API.
 //
@@ -29,6 +29,15 @@ function isTextBlock(block: unknown): block is TextContentBlock {
   if (!block || typeof block !== "object") return false;
   const rec = block as Record<string, unknown>;
   return rec.type === "text" && typeof rec.text === "string";
+}
+
+function inferMimeTypeFromBase64(base64: string): string | undefined {
+  const trimmed = base64.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith("/9j/")) return "image/jpeg";
+  if (trimmed.startsWith("iVBOR")) return "image/png";
+  if (trimmed.startsWith("R0lGOD")) return "image/gif";
+  return undefined;
 }
 
 async function resizeImageBase64IfNeeded(params: {
@@ -127,13 +136,19 @@ export async function sanitizeContentBlocksImages(
     }
 
     try {
+      const inferredMimeType = inferMimeTypeFromBase64(data);
+      const mimeType = inferredMimeType ?? block.mimeType;
       const resized = await resizeImageBase64IfNeeded({
         base64: data,
-        mimeType: block.mimeType,
+        mimeType,
         maxDimensionPx,
         maxBytes,
       });
-      out.push({ ...block, data: resized.base64, mimeType: resized.mimeType });
+      out.push({
+        ...block,
+        data: resized.base64,
+        mimeType: resized.resized ? resized.mimeType : mimeType,
+      });
     } catch (err) {
       out.push({
         type: "text",

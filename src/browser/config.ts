@@ -1,24 +1,53 @@
-import type { BrowserConfig } from "../config/config.js";
+import type { BrowserConfig, BrowserProfileConfig } from "../config/config.js";
+import {
+  deriveDefaultBrowserCdpPortRange,
+  deriveDefaultBrowserControlPort,
+} from "../config/port-defaults.js";
 import {
   DEFAULT_CLAWD_BROWSER_COLOR,
   DEFAULT_CLAWD_BROWSER_CONTROL_URL,
   DEFAULT_CLAWD_BROWSER_ENABLED,
+  DEFAULT_CLAWD_BROWSER_PROFILE_NAME,
 } from "./constants.js";
+import { CDP_PORT_RANGE_START } from "./profiles.js";
 
 export type ResolvedBrowserConfig = {
   enabled: boolean;
   controlUrl: string;
   controlHost: string;
   controlPort: number;
-  cdpPort: number;
+  cdpProtocol: "http" | "https";
+  cdpHost: string;
+  cdpIsLoopback: boolean;
   color: string;
+  executablePath?: string;
   headless: boolean;
+  noSandbox: boolean;
   attachOnly: boolean;
+  defaultProfile: string;
+  profiles: Record<string, BrowserProfileConfig>;
+};
+
+export type ResolvedBrowserProfile = {
+  name: string;
+  cdpPort: number;
+  cdpUrl: string;
+  cdpHost: string;
+  cdpIsLoopback: boolean;
+  color: string;
 };
 
 function isLoopbackHost(host: string) {
   const h = host.trim().toLowerCase();
-  return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+  return (
+    h === "localhost" ||
+    h === "127.0.0.1" ||
+    h === "0.0.0.0" ||
+    h === "[::1]" ||
+    h === "::1" ||
+    h === "[::]" ||
+    h === "::"
+  );
 }
 
 function normalizeHexColor(raw: string | undefined) {
@@ -29,17 +58,12 @@ function normalizeHexColor(raw: string | undefined) {
   return normalized.toUpperCase();
 }
 
-export function resolveBrowserConfig(
-  cfg: BrowserConfig | undefined,
-): ResolvedBrowserConfig {
-  const enabled = cfg?.enabled ?? DEFAULT_CLAWD_BROWSER_ENABLED;
-  const controlUrl = (
-    cfg?.controlUrl ?? DEFAULT_CLAWD_BROWSER_CONTROL_URL
-  ).trim();
-  const parsed = new URL(controlUrl);
+export function parseHttpUrl(raw: string, label: string) {
+  const trimmed = raw.trim();
+  const parsed = new URL(trimmed);
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error(
-      `browser.controlUrl must be http(s), got: ${parsed.protocol.replace(":", "")}`,
+      `${label} must be http(s), got: ${parsed.protocol.replace(":", "")}`,
     );
   }
 
@@ -51,33 +75,161 @@ export function resolveBrowserConfig(
         : 80;
 
   if (Number.isNaN(port) || port <= 0 || port > 65535) {
-    throw new Error(`browser.controlUrl has invalid port: ${parsed.port}`);
+    throw new Error(`${label} has invalid port: ${parsed.port}`);
   }
 
-  const cdpPort = port + 1;
-  if (cdpPort > 65535) {
-    throw new Error(
-      `browser.controlUrl port (${port}) is too high; cannot derive CDP port (${cdpPort})`,
-    );
+  return {
+    parsed,
+    port,
+    normalized: parsed.toString().replace(/\/$/, ""),
+  };
+}
+
+/**
+ * Ensure the default "clawd" profile exists in the profiles map.
+ * Auto-creates it with the legacy CDP port (from browser.cdpUrl) or first port if missing.
+ */
+function ensureDefaultProfile(
+  profiles: Record<string, BrowserProfileConfig> | undefined,
+  defaultColor: string,
+  legacyCdpPort?: number,
+  derivedDefaultCdpPort?: number,
+): Record<string, BrowserProfileConfig> {
+  const result = { ...profiles };
+  if (!result[DEFAULT_CLAWD_BROWSER_PROFILE_NAME]) {
+    result[DEFAULT_CLAWD_BROWSER_PROFILE_NAME] = {
+      cdpPort: legacyCdpPort ?? derivedDefaultCdpPort ?? CDP_PORT_RANGE_START,
+      color: defaultColor,
+    };
   }
-  if (port === cdpPort) {
-    throw new Error(
-      `browser.controlUrl port (${port}) must not equal CDP port (${cdpPort})`,
-    );
+  return result;
+}
+export function resolveBrowserConfig(
+  cfg: BrowserConfig | undefined,
+): ResolvedBrowserConfig {
+  const enabled = cfg?.enabled ?? DEFAULT_CLAWD_BROWSER_ENABLED;
+  const envControlUrl = process.env.CLAWDBOT_BROWSER_CONTROL_URL?.trim();
+  const derivedControlPort = (() => {
+    const raw = process.env.CLAWDBOT_GATEWAY_PORT?.trim();
+    if (!raw) return null;
+    const gatewayPort = Number.parseInt(raw, 10);
+    if (!Number.isFinite(gatewayPort) || gatewayPort <= 0) return null;
+    return deriveDefaultBrowserControlPort(gatewayPort);
+  })();
+  const derivedControlUrl = derivedControlPort
+    ? `http://127.0.0.1:${derivedControlPort}`
+    : null;
+
+  const controlInfo = parseHttpUrl(
+    cfg?.controlUrl ??
+      envControlUrl ??
+      derivedControlUrl ??
+      DEFAULT_CLAWD_BROWSER_CONTROL_URL,
+    "browser.controlUrl",
+  );
+  const controlPort = controlInfo.port;
+  const defaultColor = normalizeHexColor(cfg?.color);
+
+  const derivedCdpRange = deriveDefaultBrowserCdpPortRange(controlPort);
+
+  const rawCdpUrl = (cfg?.cdpUrl ?? "").trim();
+  let cdpInfo:
+    | {
+        parsed: URL;
+        port: number;
+        normalized: string;
+      }
+    | undefined;
+  if (rawCdpUrl) {
+    cdpInfo = parseHttpUrl(rawCdpUrl, "browser.cdpUrl");
+  } else {
+    const derivedPort = controlPort + 1;
+    if (derivedPort > 65535) {
+      throw new Error(
+        `browser.controlUrl port (${controlPort}) is too high; cannot derive CDP port (${derivedPort})`,
+      );
+    }
+    const derived = new URL(controlInfo.normalized);
+    derived.port = String(derivedPort);
+    cdpInfo = {
+      parsed: derived,
+      port: derivedPort,
+      normalized: derived.toString().replace(/\/$/, ""),
+    };
   }
 
   const headless = cfg?.headless === true;
+  const noSandbox = cfg?.noSandbox === true;
   const attachOnly = cfg?.attachOnly === true;
+  const executablePath = cfg?.executablePath?.trim() || undefined;
+
+  const defaultProfile =
+    cfg?.defaultProfile ?? DEFAULT_CLAWD_BROWSER_PROFILE_NAME;
+  // Use legacy cdpUrl port for backward compatibility when no profiles configured
+  const legacyCdpPort = rawCdpUrl ? cdpInfo.port : undefined;
+  const profiles = ensureDefaultProfile(
+    cfg?.profiles,
+    defaultColor,
+    legacyCdpPort,
+    derivedCdpRange.start,
+  );
+  const cdpProtocol = cdpInfo.parsed.protocol === "https:" ? "https" : "http";
 
   return {
     enabled,
-    controlUrl: parsed.toString().replace(/\/$/, ""),
-    controlHost: parsed.hostname,
-    controlPort: port,
-    cdpPort,
-    color: normalizeHexColor(cfg?.color),
+    controlUrl: controlInfo.normalized,
+    controlHost: controlInfo.parsed.hostname,
+    controlPort,
+    cdpProtocol,
+    cdpHost: cdpInfo.parsed.hostname,
+    cdpIsLoopback: isLoopbackHost(cdpInfo.parsed.hostname),
+    color: defaultColor,
+    executablePath,
     headless,
+    noSandbox,
     attachOnly,
+    defaultProfile,
+    profiles,
+  };
+}
+
+/**
+ * Resolve a profile by name from the config.
+ * Returns null if the profile doesn't exist.
+ */
+export function resolveProfile(
+  resolved: ResolvedBrowserConfig,
+  profileName: string,
+): ResolvedBrowserProfile | null {
+  const profile = resolved.profiles[profileName];
+  if (!profile) return null;
+
+  const rawProfileUrl = profile.cdpUrl?.trim() ?? "";
+  let cdpHost = resolved.cdpHost;
+  let cdpPort = profile.cdpPort ?? 0;
+  let cdpUrl = "";
+
+  if (rawProfileUrl) {
+    const parsed = parseHttpUrl(
+      rawProfileUrl,
+      `browser.profiles.${profileName}.cdpUrl`,
+    );
+    cdpHost = parsed.parsed.hostname;
+    cdpPort = parsed.port;
+    cdpUrl = parsed.normalized;
+  } else if (cdpPort) {
+    cdpUrl = `${resolved.cdpProtocol}://${resolved.cdpHost}:${cdpPort}`;
+  } else {
+    throw new Error(`Profile "${profileName}" must define cdpPort or cdpUrl.`);
+  }
+
+  return {
+    name: profileName,
+    cdpPort,
+    cdpUrl,
+    cdpHost,
+    cdpIsLoopback: isLoopbackHost(cdpHost),
+    color: profile.color,
   };
 }
 

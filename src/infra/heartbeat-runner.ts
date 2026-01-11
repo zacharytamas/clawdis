@@ -1,59 +1,48 @@
-import { chunkText } from "../auto-reply/chunk.js";
+import { resolveEffectiveMessagesConfig } from "../agents/identity.js";
 import {
-  HEARTBEAT_PROMPT,
+  DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
+  DEFAULT_HEARTBEAT_EVERY,
+  resolveHeartbeatPrompt as resolveHeartbeatPromptText,
   stripHeartbeatToken,
 } from "../auto-reply/heartbeat.js";
 import { getReplyFromConfig } from "../auto-reply/reply.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
 import { parseDurationMs } from "../cli/parse-duration.js";
-import type { ClawdisConfig } from "../config/config.js";
+import type { ClawdbotConfig } from "../config/config.js";
 import { loadConfig } from "../config/config.js";
 import {
   loadSessionStore,
+  resolveAgentIdFromSessionKey,
+  resolveMainSessionKey,
   resolveStorePath,
-  type SessionEntry,
   saveSessionStore,
 } from "../config/sessions.js";
-import { sendMessageDiscord } from "../discord/send.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging.js";
 import { getQueueSize } from "../process/command-queue.js";
-import { webAuthExists } from "../providers/web/index.js";
+import {
+  getProviderPlugin,
+  normalizeProviderId,
+} from "../providers/plugins/index.js";
+import type { ProviderHeartbeatDeps } from "../providers/plugins/types.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
-import { sendMessageTelegram } from "../telegram/send.js";
-import { normalizeE164 } from "../utils.js";
-import { getActiveWebListener } from "../web/active-listener.js";
-import { sendMessageWhatsApp } from "../web/outbound.js";
+import { INTERNAL_MESSAGE_PROVIDER } from "../utils/message-provider.js";
 import { emitHeartbeatEvent } from "./heartbeat-events.js";
 import {
   type HeartbeatRunResult,
   requestHeartbeatNow,
   setHeartbeatWakeHandler,
 } from "./heartbeat-wake.js";
+import type { OutboundSendDeps } from "./outbound/deliver.js";
+import { deliverOutboundPayloads } from "./outbound/deliver.js";
+import { resolveHeartbeatDeliveryTarget } from "./outbound/targets.js";
 
-export type HeartbeatTarget =
-  | "last"
-  | "whatsapp"
-  | "telegram"
-  | "discord"
-  | "none";
-
-export type HeartbeatDeliveryTarget = {
-  channel: "whatsapp" | "telegram" | "discord" | "none";
-  to?: string;
-  reason?: string;
-};
-
-type HeartbeatDeps = {
-  runtime?: RuntimeEnv;
-  sendWhatsApp?: typeof sendMessageWhatsApp;
-  sendTelegram?: typeof sendMessageTelegram;
-  sendDiscord?: typeof sendMessageDiscord;
-  getQueueSize?: (lane?: string) => number;
-  nowMs?: () => number;
-  webAuthExists?: () => Promise<boolean>;
-  hasActiveWebListener?: () => boolean;
-};
+type HeartbeatDeps = OutboundSendDeps &
+  ProviderHeartbeatDeps & {
+    runtime?: RuntimeEnv;
+    getQueueSize?: (lane?: string) => number;
+    nowMs?: () => number;
+  };
 
 const log = createSubsystemLogger("gateway/heartbeat");
 let heartbeatsEnabled = true;
@@ -63,10 +52,13 @@ export function setHeartbeatsEnabled(enabled: boolean) {
 }
 
 export function resolveHeartbeatIntervalMs(
-  cfg: ClawdisConfig,
+  cfg: ClawdbotConfig,
   overrideEvery?: string,
 ) {
-  const raw = overrideEvery ?? cfg.agent?.heartbeat?.every;
+  const raw =
+    overrideEvery ??
+    cfg.agents?.defaults?.heartbeat?.every ??
+    DEFAULT_HEARTBEAT_EVERY;
   if (!raw) return null;
   const trimmed = String(raw).trim();
   if (!trimmed) return null;
@@ -80,18 +72,24 @@ export function resolveHeartbeatIntervalMs(
   return ms;
 }
 
-export function resolveHeartbeatPrompt(cfg: ClawdisConfig) {
-  const raw = cfg.agent?.heartbeat?.prompt;
-  const trimmed = typeof raw === "string" ? raw.trim() : "";
-  return trimmed || HEARTBEAT_PROMPT;
+export function resolveHeartbeatPrompt(cfg: ClawdbotConfig) {
+  return resolveHeartbeatPromptText(cfg.agents?.defaults?.heartbeat?.prompt);
 }
 
-function resolveHeartbeatSession(cfg: ClawdisConfig) {
+function resolveHeartbeatAckMaxChars(cfg: ClawdbotConfig) {
+  return Math.max(
+    0,
+    cfg.agents?.defaults?.heartbeat?.ackMaxChars ??
+      DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
+  );
+}
+
+function resolveHeartbeatSession(cfg: ClawdbotConfig) {
   const sessionCfg = cfg.session;
   const scope = sessionCfg?.scope ?? "per-sender";
-  const mainKey = (sessionCfg?.mainKey ?? "main").trim() || "main";
-  const sessionKey = scope === "global" ? "global" : mainKey;
-  const storePath = resolveStorePath(sessionCfg?.store);
+  const sessionKey = scope === "global" ? "global" : resolveMainSessionKey(cfg);
+  const agentId = resolveAgentIdFromSessionKey(sessionKey);
+  const storePath = resolveStorePath(sessionCfg?.store, { agentId });
   const store = loadSessionStore(storePath);
   const entry = store[sessionKey];
   return { sessionKey, storePath, store, entry };
@@ -116,16 +114,29 @@ function resolveHeartbeatReplyPayload(
   return undefined;
 }
 
+function resolveHeartbeatReasoningPayloads(
+  replyResult: ReplyPayload | ReplyPayload[] | undefined,
+): ReplyPayload[] {
+  const payloads = Array.isArray(replyResult)
+    ? replyResult
+    : replyResult
+      ? [replyResult]
+      : [];
+  return payloads.filter((payload) => {
+    const text = typeof payload.text === "string" ? payload.text : "";
+    return text.trimStart().startsWith("Reasoning:");
+  });
+}
+
 function resolveHeartbeatSender(params: {
   allowFrom: Array<string | number>;
   lastTo?: string;
-  lastChannel?: SessionEntry["lastChannel"];
+  provider?: string | null;
 }) {
-  const { allowFrom, lastTo, lastChannel } = params;
+  const { allowFrom, lastTo, provider } = params;
   const candidates = [
     lastTo?.trim(),
-    lastChannel === "telegram" && lastTo ? `telegram:${lastTo}` : undefined,
-    lastChannel === "whatsapp" && lastTo ? `whatsapp:${lastTo}` : undefined,
+    provider && lastTo ? `${provider}:${lastTo}` : undefined,
   ].filter((val): val is string => Boolean(val?.trim()));
 
   const allowList = allowFrom
@@ -147,88 +158,6 @@ function resolveHeartbeatSender(params: {
   return candidates[0] ?? "heartbeat";
 }
 
-async function resolveWhatsAppReadiness(
-  cfg: ClawdisConfig,
-  deps?: HeartbeatDeps,
-): Promise<{ ok: boolean; reason: string }> {
-  if (cfg.web?.enabled === false) {
-    return { ok: false, reason: "whatsapp-disabled" };
-  }
-  const authExists = await (deps?.webAuthExists ?? webAuthExists)();
-  if (!authExists) {
-    return { ok: false, reason: "whatsapp-not-linked" };
-  }
-  const listenerActive = deps?.hasActiveWebListener
-    ? deps.hasActiveWebListener()
-    : Boolean(getActiveWebListener());
-  if (!listenerActive) {
-    return { ok: false, reason: "whatsapp-not-running" };
-  }
-  return { ok: true, reason: "ok" };
-}
-
-export function resolveHeartbeatDeliveryTarget(params: {
-  cfg: ClawdisConfig;
-  entry?: SessionEntry;
-}): HeartbeatDeliveryTarget {
-  const { cfg, entry } = params;
-  const rawTarget = cfg.agent?.heartbeat?.target;
-  const target: HeartbeatTarget =
-    rawTarget === "whatsapp" ||
-    rawTarget === "telegram" ||
-    rawTarget === "discord" ||
-    rawTarget === "none" ||
-    rawTarget === "last"
-      ? rawTarget
-      : "last";
-  if (target === "none") {
-    return { channel: "none", reason: "target-none" };
-  }
-
-  const explicitTo =
-    typeof cfg.agent?.heartbeat?.to === "string" &&
-    cfg.agent.heartbeat.to.trim()
-      ? cfg.agent.heartbeat.to.trim()
-      : undefined;
-
-  const lastChannel =
-    entry?.lastChannel && entry.lastChannel !== "webchat"
-      ? entry.lastChannel
-      : undefined;
-  const lastTo = typeof entry?.lastTo === "string" ? entry.lastTo.trim() : "";
-
-  const channel: "whatsapp" | "telegram" | "discord" | undefined =
-    target === "last"
-      ? lastChannel
-      : target === "whatsapp" || target === "telegram" || target === "discord"
-        ? target
-        : undefined;
-
-  const to =
-    explicitTo ||
-    (channel && lastChannel === channel ? lastTo : undefined) ||
-    (target === "last" ? lastTo : undefined);
-
-  if (!channel || !to) {
-    return { channel: "none", reason: "no-target" };
-  }
-
-  if (channel !== "whatsapp") {
-    return { channel, to };
-  }
-
-  const rawAllow = cfg.routing?.allowFrom ?? [];
-  if (rawAllow.includes("*")) return { channel, to };
-  const allowFrom = rawAllow
-    .map((val) => normalizeE164(val))
-    .filter((val) => val.length > 1);
-  if (allowFrom.length === 0) return { channel, to };
-
-  const normalized = normalizeE164(to);
-  if (allowFrom.includes(normalized)) return { channel, to: normalized };
-  return { channel, to: allowFrom[0], reason: "allowFrom-fallback" };
-}
-
 async function restoreHeartbeatUpdatedAt(params: {
   storePath: string;
   sessionKey: string;
@@ -246,9 +175,13 @@ async function restoreHeartbeatUpdatedAt(params: {
 
 function normalizeHeartbeatReply(
   payload: ReplyPayload,
-  responsePrefix?: string,
+  responsePrefix: string | undefined,
+  ackMaxChars: number,
 ) {
-  const stripped = stripHeartbeatToken(payload.text);
+  const stripped = stripHeartbeatToken(payload.text, {
+    mode: "heartbeat",
+    maxAckChars: ackMaxChars,
+  });
   const hasMedia = Boolean(
     payload.mediaUrl || (payload.mediaUrls?.length ?? 0) > 0,
   );
@@ -266,62 +199,8 @@ function normalizeHeartbeatReply(
   return { shouldSkip: false, text: finalText, hasMedia };
 }
 
-async function deliverHeartbeatReply(params: {
-  channel: "whatsapp" | "telegram" | "discord";
-  to: string;
-  text: string;
-  mediaUrls: string[];
-  deps: Required<
-    Pick<HeartbeatDeps, "sendWhatsApp" | "sendTelegram" | "sendDiscord">
-  >;
-}) {
-  const { channel, to, text, mediaUrls, deps } = params;
-  if (channel === "whatsapp") {
-    if (mediaUrls.length === 0) {
-      for (const chunk of chunkText(text, 4000)) {
-        await deps.sendWhatsApp(to, chunk, { verbose: false });
-      }
-      return;
-    }
-    let first = true;
-    for (const url of mediaUrls) {
-      const caption = first ? text : "";
-      first = false;
-      await deps.sendWhatsApp(to, caption, { verbose: false, mediaUrl: url });
-    }
-    return;
-  }
-
-  if (channel === "telegram") {
-    if (mediaUrls.length === 0) {
-      for (const chunk of chunkText(text, 4000)) {
-        await deps.sendTelegram(to, chunk, { verbose: false });
-      }
-      return;
-    }
-    let first = true;
-    for (const url of mediaUrls) {
-      const caption = first ? text : "";
-      first = false;
-      await deps.sendTelegram(to, caption, { verbose: false, mediaUrl: url });
-    }
-    return;
-  }
-
-  if (mediaUrls.length === 0) {
-    await deps.sendDiscord(to, text, { verbose: false });
-    return;
-  }
-  let first = true;
-  for (const url of mediaUrls) {
-    const caption = first ? text : "";
-    first = false;
-    await deps.sendDiscord(to, caption, { verbose: false, mediaUrl: url });
-  }
-}
-
 export async function runHeartbeatOnce(opts: {
-  cfg?: ClawdisConfig;
+  cfg?: ClawdbotConfig;
   reason?: string;
   deps?: HeartbeatDeps;
 }): Promise<HeartbeatRunResult> {
@@ -341,18 +220,31 @@ export async function runHeartbeatOnce(opts: {
   const startedAt = opts.deps?.nowMs?.() ?? Date.now();
   const { entry, sessionKey, storePath } = resolveHeartbeatSession(cfg);
   const previousUpdatedAt = entry?.updatedAt;
-  const allowFrom = cfg.routing?.allowFrom ?? [];
+  const delivery = resolveHeartbeatDeliveryTarget({ cfg, entry });
+  const lastProvider =
+    entry?.lastProvider && entry.lastProvider !== INTERNAL_MESSAGE_PROVIDER
+      ? normalizeProviderId(entry.lastProvider)
+      : undefined;
+  const senderProvider =
+    delivery.provider !== "none" ? delivery.provider : lastProvider;
+  const senderAllowFrom = senderProvider
+    ? (getProviderPlugin(senderProvider)?.config.resolveAllowFrom?.({
+        cfg,
+        accountId:
+          senderProvider === lastProvider ? entry?.lastAccountId : undefined,
+      }) ?? [])
+    : [];
   const sender = resolveHeartbeatSender({
-    allowFrom,
+    allowFrom: senderAllowFrom,
     lastTo: entry?.lastTo,
-    lastChannel: entry?.lastChannel,
+    provider: senderProvider,
   });
   const prompt = resolveHeartbeatPrompt(cfg);
   const ctx = {
     Body: prompt,
     From: sender,
     To: sender,
-    Surface: "heartbeat",
+    Provider: "heartbeat",
   };
 
   try {
@@ -362,6 +254,13 @@ export async function runHeartbeatOnce(opts: {
       cfg,
     );
     const replyPayload = resolveHeartbeatReplyPayload(replyResult);
+    const includeReasoning =
+      cfg.agents?.defaults?.heartbeat?.includeReasoning === true;
+    const reasoningPayloads = includeReasoning
+      ? resolveHeartbeatReasoningPayloads(replyResult).filter(
+          (payload) => payload !== replyPayload,
+        )
+      : [];
 
     if (
       !replyPayload ||
@@ -382,11 +281,17 @@ export async function runHeartbeatOnce(opts: {
       return { status: "ran", durationMs: Date.now() - startedAt };
     }
 
+    const ackMaxChars = resolveHeartbeatAckMaxChars(cfg);
     const normalized = normalizeHeartbeatReply(
       replyPayload,
-      cfg.messages?.responsePrefix,
+      resolveEffectiveMessagesConfig(
+        cfg,
+        resolveAgentIdFromSessionKey(sessionKey),
+      ).responsePrefix,
+      ackMaxChars,
     );
-    if (normalized.shouldSkip && !normalized.hasMedia) {
+    const shouldSkipMain = normalized.shouldSkip && !normalized.hasMedia;
+    if (shouldSkipMain && reasoningPayloads.length === 0) {
       await restoreHeartbeatUpdatedAt({
         storePath,
         sessionKey,
@@ -400,56 +305,76 @@ export async function runHeartbeatOnce(opts: {
       return { status: "ran", durationMs: Date.now() - startedAt };
     }
 
-    const delivery = resolveHeartbeatDeliveryTarget({ cfg, entry });
     const mediaUrls =
       replyPayload.mediaUrls ??
       (replyPayload.mediaUrl ? [replyPayload.mediaUrl] : []);
+    // Reasoning payloads are text-only; any attachments stay on the main reply.
+    const previewText = shouldSkipMain
+      ? reasoningPayloads
+          .map((payload) => payload.text)
+          .filter((text): text is string => Boolean(text?.trim()))
+          .join("\n")
+      : normalized.text;
 
-    if (delivery.channel === "none" || !delivery.to) {
+    if (delivery.provider === "none" || !delivery.to) {
       emitHeartbeatEvent({
         status: "skipped",
         reason: delivery.reason ?? "no-target",
-        preview: normalized.text?.slice(0, 200),
+        preview: previewText?.slice(0, 200),
         durationMs: Date.now() - startedAt,
         hasMedia: mediaUrls.length > 0,
       });
       return { status: "ran", durationMs: Date.now() - startedAt };
     }
 
-    if (delivery.channel === "whatsapp") {
-      const readiness = await resolveWhatsAppReadiness(cfg, opts.deps);
+    const deliveryAccountId =
+      delivery.provider === lastProvider ? entry?.lastAccountId : undefined;
+    const heartbeatPlugin = getProviderPlugin(delivery.provider);
+    if (heartbeatPlugin?.heartbeat?.checkReady) {
+      const readiness = await heartbeatPlugin.heartbeat.checkReady({
+        cfg,
+        accountId: deliveryAccountId,
+        deps: opts.deps,
+      });
       if (!readiness.ok) {
         emitHeartbeatEvent({
           status: "skipped",
           reason: readiness.reason,
-          preview: normalized.text?.slice(0, 200),
+          preview: previewText?.slice(0, 200),
           durationMs: Date.now() - startedAt,
           hasMedia: mediaUrls.length > 0,
         });
-        log.info("heartbeat: whatsapp not ready", {
+        log.info("heartbeat: provider not ready", {
+          provider: delivery.provider,
           reason: readiness.reason,
         });
         return { status: "skipped", reason: readiness.reason };
       }
     }
 
-    const deps = {
-      sendWhatsApp: opts.deps?.sendWhatsApp ?? sendMessageWhatsApp,
-      sendTelegram: opts.deps?.sendTelegram ?? sendMessageTelegram,
-      sendDiscord: opts.deps?.sendDiscord ?? sendMessageDiscord,
-    };
-    await deliverHeartbeatReply({
-      channel: delivery.channel,
+    await deliverOutboundPayloads({
+      cfg,
+      provider: delivery.provider,
       to: delivery.to,
-      text: normalized.text,
-      mediaUrls,
-      deps,
+      accountId: deliveryAccountId,
+      payloads: [
+        ...reasoningPayloads,
+        ...(shouldSkipMain
+          ? []
+          : [
+              {
+                text: normalized.text,
+                mediaUrls,
+              },
+            ]),
+      ],
+      deps: opts.deps,
     });
 
     emitHeartbeatEvent({
       status: "sent",
       to: delivery.to,
-      preview: normalized.text?.slice(0, 200),
+      preview: previewText?.slice(0, 200),
       durationMs: Date.now() - startedAt,
       hasMedia: mediaUrls.length > 0,
     });
@@ -467,7 +392,7 @@ export async function runHeartbeatOnce(opts: {
 }
 
 export function startHeartbeatRunner(opts: {
-  cfg?: ClawdisConfig;
+  cfg?: ClawdbotConfig;
   runtime?: RuntimeEnv;
   abortSignal?: AbortSignal;
 }) {

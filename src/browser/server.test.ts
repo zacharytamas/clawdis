@@ -4,6 +4,7 @@ import { fetch as realFetch } from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let testPort = 0;
+let cdpBaseUrl = "";
 let reachable = false;
 let cfgAttachOnly = false;
 let createTargetId: string | null = null;
@@ -63,33 +64,46 @@ function makeProc(pid = 123) {
 
 const proc = makeProc();
 
-vi.mock("../config/config.js", () => ({
-  loadConfig: () => ({
-    browser: {
-      enabled: true,
-      controlUrl: `http://127.0.0.1:${testPort}`,
-      color: "#FF4500",
-      attachOnly: cfgAttachOnly,
-      headless: true,
-    },
-  }),
-}));
+vi.mock("../config/config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/config.js")>();
+  return {
+    ...actual,
+    loadConfig: () => ({
+      browser: {
+        enabled: true,
+        controlUrl: `http://127.0.0.1:${testPort}`,
+        color: "#FF4500",
+        attachOnly: cfgAttachOnly,
+        headless: true,
+        defaultProfile: "clawd",
+        profiles: {
+          clawd: { cdpPort: testPort + 1, color: "#FF4500" },
+        },
+      },
+    }),
+    writeConfigFile: vi.fn(async () => {}),
+  };
+});
 
 const launchCalls = vi.hoisted(() => [] as Array<{ port: number }>);
 vi.mock("./chrome.js", () => ({
+  isChromeCdpReady: vi.fn(async () => reachable),
   isChromeReachable: vi.fn(async () => reachable),
-  launchClawdChrome: vi.fn(async (resolved: { cdpPort: number }) => {
-    launchCalls.push({ port: resolved.cdpPort });
-    reachable = true;
-    return {
-      pid: 123,
-      exe: { kind: "chrome", path: "/fake/chrome" },
-      userDataDir: "/tmp/clawd",
-      cdpPort: resolved.cdpPort,
-      startedAt: Date.now(),
-      proc,
-    };
-  }),
+  launchClawdChrome: vi.fn(
+    async (_resolved: unknown, profile: { cdpPort: number }) => {
+      launchCalls.push({ port: profile.cdpPort });
+      reachable = true;
+      return {
+        pid: 123,
+        exe: { kind: "chrome", path: "/fake/chrome" },
+        userDataDir: "/tmp/clawd",
+        cdpPort: profile.cdpPort,
+        startedAt: Date.now(),
+        proc,
+      };
+    },
+  ),
+  resolveClawdUserDataDir: vi.fn(() => "/tmp/clawd"),
   stopClawdChrome: vi.fn(async () => {
     reachable = false;
   }),
@@ -97,6 +111,7 @@ vi.mock("./chrome.js", () => ({
 
 vi.mock("./cdp.js", () => ({
   createTargetViaCdp: cdpMocks.createTargetViaCdp,
+  normalizeCdpWsUrl: vi.fn((wsUrl: string) => wsUrl),
   snapshotAria: cdpMocks.snapshotAria,
 }));
 
@@ -117,14 +132,17 @@ vi.mock("./screenshot.js", () => ({
 }));
 
 async function getFreePort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const s = createServer();
-    s.once("error", reject);
-    s.listen(0, "127.0.0.1", () => {
-      const port = (s.address() as AddressInfo).port;
-      s.close((err) => (err ? reject(err) : resolve(port)));
+  while (true) {
+    const port = await new Promise<number>((resolve, reject) => {
+      const s = createServer();
+      s.once("error", reject);
+      s.listen(0, "127.0.0.1", () => {
+        const assigned = (s.address() as AddressInfo).port;
+        s.close((err) => (err ? reject(err) : resolve(assigned)));
+      });
     });
-  });
+    if (port < 65535) return port;
+  }
 }
 
 function makeResponse(
@@ -157,6 +175,7 @@ describe("browser control server", () => {
     for (const fn of Object.values(cdpMocks)) fn.mockClear();
 
     testPort = await getFreePort();
+    cdpBaseUrl = `http://127.0.0.1:${testPort + 1}`;
 
     // Minimal CDP JSON endpoints used by the server.
     let putNewCalls = 0;
@@ -291,7 +310,7 @@ describe("browser control server", () => {
     expect(snapAi.ok).toBe(true);
     expect(snapAi.format).toBe("ai");
     expect(pwMocks.snapshotAiViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
     });
 
@@ -303,7 +322,7 @@ describe("browser control server", () => {
     expect(nav.ok).toBe(true);
     expect(typeof nav.targetId).toBe("string");
     expect(pwMocks.navigateViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       url: "https://example.com",
     });
@@ -320,7 +339,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(click.ok).toBe(true);
     expect(pwMocks.clickViaPlaywright).toHaveBeenNthCalledWith(1, {
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       ref: "1",
       doubleClick: false,
@@ -349,7 +368,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(type.ok).toBe(true);
     expect(pwMocks.typeViaPlaywright).toHaveBeenNthCalledWith(1, {
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       ref: "1",
       text: "",
@@ -364,7 +383,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(press.ok).toBe(true);
     expect(pwMocks.pressKeyViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       key: "Enter",
     });
@@ -376,7 +395,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(hover.ok).toBe(true);
     expect(pwMocks.hoverViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       ref: "2",
     });
@@ -388,7 +407,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(drag.ok).toBe(true);
     expect(pwMocks.dragViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       startRef: "3",
       endRef: "4",
@@ -401,7 +420,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(select.ok).toBe(true);
     expect(pwMocks.selectOptionViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       ref: "5",
       values: ["a", "b"],
@@ -417,7 +436,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(fill.ok).toBe(true);
     expect(pwMocks.fillFormViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       fields: [{ ref: "6", type: "textbox", value: "hello" }],
     });
@@ -429,7 +448,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(resize.ok).toBe(true);
     expect(pwMocks.resizeViewportViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       width: 800,
       height: 600,
@@ -442,7 +461,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(wait.ok).toBe(true);
     expect(pwMocks.waitForViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       timeMs: 5,
       text: undefined,
@@ -457,7 +476,7 @@ describe("browser control server", () => {
     expect(evalRes.ok).toBe(true);
     expect(evalRes.result).toBe("ok");
     expect(pwMocks.evaluateViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       fn: "() => 1",
       ref: undefined,
@@ -470,7 +489,7 @@ describe("browser control server", () => {
     }).then((r) => r.json());
     expect(upload).toMatchObject({ ok: true });
     expect(pwMocks.armFileUploadViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       paths: ["/tmp/a.txt"],
       timeoutMs: 1234,
@@ -483,13 +502,13 @@ describe("browser control server", () => {
     }).then((r) => r.json());
     expect(uploadWithRef).toMatchObject({ ok: true });
     expect(pwMocks.armFileUploadViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       paths: ["/tmp/b.txt"],
       timeoutMs: undefined,
     });
     expect(pwMocks.clickViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       ref: "e12",
     });
@@ -501,7 +520,7 @@ describe("browser control server", () => {
     }).then((r) => r.json());
     expect(uploadWithInputRef).toMatchObject({ ok: true });
     expect(pwMocks.setInputFilesViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       inputRef: "e99",
       element: undefined,
@@ -518,7 +537,7 @@ describe("browser control server", () => {
     }).then((r) => r.json());
     expect(uploadWithElement).toMatchObject({ ok: true });
     expect(pwMocks.setInputFilesViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       inputRef: undefined,
       element: "input[type=file]",
@@ -532,7 +551,7 @@ describe("browser control server", () => {
     }).then((r) => r.json());
     expect(dialog).toMatchObject({ ok: true });
     expect(pwMocks.armDialogViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       accept: true,
       promptText: undefined,
@@ -545,7 +564,7 @@ describe("browser control server", () => {
     expect(consoleRes.ok).toBe(true);
     expect(Array.isArray(consoleRes.messages)).toBe(true);
     expect(pwMocks.getConsoleMessagesViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       level: "error",
     });
@@ -566,7 +585,7 @@ describe("browser control server", () => {
     expect(shot.ok).toBe(true);
     expect(typeof shot.path).toBe("string");
     expect(pwMocks.takeScreenshotViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
       ref: undefined,
       element: "body",
@@ -581,7 +600,7 @@ describe("browser control server", () => {
     }).then((r) => r.json())) as { ok: boolean };
     expect(close.ok).toBe(true);
     expect(pwMocks.closePageViaPlaywright).toHaveBeenCalledWith({
-      cdpPort: testPort + 1,
+      cdpUrl: cdpBaseUrl,
       targetId: "abcd1234",
     });
 
@@ -688,6 +707,50 @@ describe("browser control server", () => {
     expect(started.error ?? "").toMatch(/attachOnly/i);
   });
 
+  it("allows attachOnly servers to ensure reachability via callback", async () => {
+    cfgAttachOnly = true;
+    reachable = false;
+    const { startBrowserBridgeServer } = await import("./bridge-server.js");
+
+    const ensured = vi.fn(async () => {
+      reachable = true;
+    });
+
+    const bridge = await startBrowserBridgeServer({
+      resolved: {
+        enabled: true,
+        controlUrl: "http://127.0.0.1:0",
+        controlHost: "127.0.0.1",
+        controlPort: 0,
+        cdpProtocol: "http",
+        cdpHost: "127.0.0.1",
+        cdpIsLoopback: true,
+        color: "#FF4500",
+        headless: true,
+        noSandbox: false,
+        attachOnly: true,
+        defaultProfile: "clawd",
+        profiles: {
+          clawd: { cdpPort: testPort + 1, color: "#FF4500" },
+        },
+      },
+      onEnsureAttachTarget: ensured,
+    });
+
+    const started = (await realFetch(`${bridge.baseUrl}/start`, {
+      method: "POST",
+    }).then((r) => r.json())) as { ok?: boolean; error?: string };
+    expect(started.error).toBeUndefined();
+    expect(started.ok).toBe(true);
+    const status = (await realFetch(`${bridge.baseUrl}/`).then((r) =>
+      r.json(),
+    )) as { running?: boolean };
+    expect(status.running).toBe(true);
+    expect(ensured).toHaveBeenCalledTimes(1);
+
+    await new Promise<void>((resolve) => bridge.server.close(() => resolve()));
+  });
+
   it("opens tabs via CDP createTarget path", async () => {
     const { startBrowserControlServerFromConfig } = await import("./server.js");
     await startBrowserControlServerFromConfig();
@@ -739,5 +802,346 @@ describe("browser control server", () => {
       `${base}/snapshot?format=aria&targetId=abc`,
     );
     expect(snapAmbiguous.status).toBe(409);
+  });
+});
+
+describe("backward compatibility (profile parameter)", () => {
+  beforeEach(async () => {
+    reachable = false;
+    cfgAttachOnly = false;
+    createTargetId = null;
+
+    for (const fn of Object.values(pwMocks)) fn.mockClear();
+    for (const fn of Object.values(cdpMocks)) fn.mockClear();
+
+    testPort = await getFreePort();
+    cdpBaseUrl = `http://127.0.0.1:${testPort + 1}`;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const u = String(url);
+        if (u.includes("/json/list")) {
+          if (!reachable) return makeResponse([]);
+          return makeResponse([
+            {
+              id: "abcd1234",
+              title: "Tab",
+              url: "https://example.com",
+              webSocketDebuggerUrl: "ws://127.0.0.1/devtools/page/abcd1234",
+              type: "page",
+            },
+          ]);
+        }
+        if (u.includes("/json/new?")) {
+          return makeResponse({
+            id: "newtab1",
+            title: "",
+            url: "about:blank",
+            webSocketDebuggerUrl: "ws://127.0.0.1/devtools/page/newtab1",
+            type: "page",
+          });
+        }
+        if (u.includes("/json/activate/")) return makeResponse("ok");
+        if (u.includes("/json/close/")) return makeResponse("ok");
+        return makeResponse({}, { ok: false, status: 500, text: "unexpected" });
+      }),
+    );
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    const { stopBrowserControlServer } = await import("./server.js");
+    await stopBrowserControlServer();
+  });
+
+  it("GET / without profile uses default profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const status = (await realFetch(`${base}/`).then((r) => r.json())) as {
+      running: boolean;
+      profile?: string;
+    };
+    expect(status.running).toBe(false);
+    // Should use default profile (clawd)
+    expect(status.profile).toBe("clawd");
+  });
+
+  it("POST /start without profile uses default profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = (await realFetch(`${base}/start`, { method: "POST" }).then(
+      (r) => r.json(),
+    )) as { ok: boolean; profile?: string };
+    expect(result.ok).toBe(true);
+    expect(result.profile).toBe("clawd");
+  });
+
+  it("POST /stop without profile uses default profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    await realFetch(`${base}/start`, { method: "POST" });
+
+    const result = (await realFetch(`${base}/stop`, { method: "POST" }).then(
+      (r) => r.json(),
+    )) as { ok: boolean; profile?: string };
+    expect(result.ok).toBe(true);
+    expect(result.profile).toBe("clawd");
+  });
+
+  it("GET /tabs without profile uses default profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    await realFetch(`${base}/start`, { method: "POST" });
+
+    const result = (await realFetch(`${base}/tabs`).then((r) => r.json())) as {
+      running: boolean;
+      tabs: unknown[];
+    };
+    expect(result.running).toBe(true);
+    expect(Array.isArray(result.tabs)).toBe(true);
+  });
+
+  it("POST /tabs/open without profile uses default profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    await realFetch(`${base}/start`, { method: "POST" });
+
+    const result = (await realFetch(`${base}/tabs/open`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://example.com" }),
+    }).then((r) => r.json())) as { targetId?: string };
+    expect(result.targetId).toBe("newtab1");
+  });
+
+  it("GET /profiles returns list of profiles", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = (await realFetch(`${base}/profiles`).then((r) =>
+      r.json(),
+    )) as { profiles: Array<{ name: string }> };
+    expect(Array.isArray(result.profiles)).toBe(true);
+    // Should at least have the default clawd profile
+    expect(result.profiles.some((p) => p.name === "clawd")).toBe(true);
+  });
+
+  it("GET /tabs?profile=clawd returns tabs for specified profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    await realFetch(`${base}/start`, { method: "POST" });
+
+    const result = (await realFetch(`${base}/tabs?profile=clawd`).then((r) =>
+      r.json(),
+    )) as { running: boolean; tabs: unknown[] };
+    expect(result.running).toBe(true);
+    expect(Array.isArray(result.tabs)).toBe(true);
+  });
+
+  it("POST /tabs/open?profile=clawd opens tab in specified profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    await realFetch(`${base}/start`, { method: "POST" });
+
+    const result = (await realFetch(`${base}/tabs/open?profile=clawd`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://example.com" }),
+    }).then((r) => r.json())) as { targetId?: string };
+    expect(result.targetId).toBe("newtab1");
+  });
+
+  it("GET /tabs?profile=unknown returns 404", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/tabs?profile=unknown`);
+    expect(result.status).toBe(404);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("not found");
+  });
+
+  it("POST /tabs/open?profile=unknown returns 404", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/tabs/open?profile=unknown`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://example.com" }),
+    });
+    expect(result.status).toBe(404);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("not found");
+  });
+});
+
+describe("profile CRUD endpoints", () => {
+  beforeEach(async () => {
+    reachable = false;
+    cfgAttachOnly = false;
+
+    for (const fn of Object.values(pwMocks)) fn.mockClear();
+    for (const fn of Object.values(cdpMocks)) fn.mockClear();
+
+    testPort = await getFreePort();
+    cdpBaseUrl = `http://127.0.0.1:${testPort + 1}`;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const u = String(url);
+        if (u.includes("/json/list")) return makeResponse([]);
+        return makeResponse({}, { ok: false, status: 500, text: "unexpected" });
+      }),
+    );
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    const { stopBrowserControlServer } = await import("./server.js");
+    await stopBrowserControlServer();
+  });
+
+  it("POST /profiles/create returns 400 for missing name", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/profiles/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(result.status).toBe(400);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("name is required");
+  });
+
+  it("POST /profiles/create returns 400 for invalid name format", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/profiles/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Invalid Name!" }),
+    });
+    expect(result.status).toBe(400);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("invalid profile name");
+  });
+
+  it("POST /profiles/create returns 409 for duplicate name", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    // "clawd" already exists as the default profile
+    const result = await realFetch(`${base}/profiles/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "clawd" }),
+    });
+    expect(result.status).toBe(409);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("already exists");
+  });
+
+  it("POST /profiles/create accepts cdpUrl for remote profiles", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/profiles/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "remote", cdpUrl: "http://10.0.0.42:9222" }),
+    });
+    expect(result.status).toBe(200);
+    const body = (await result.json()) as {
+      profile?: string;
+      cdpUrl?: string;
+      isRemote?: boolean;
+    };
+    expect(body.profile).toBe("remote");
+    expect(body.cdpUrl).toBe("http://10.0.0.42:9222");
+    expect(body.isRemote).toBe(true);
+  });
+
+  it("POST /profiles/create returns 400 for invalid cdpUrl", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/profiles/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "badremote", cdpUrl: "ws://bad" }),
+    });
+    expect(result.status).toBe(400);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("cdpUrl");
+  });
+
+  it("DELETE /profiles/:name returns 404 for non-existent profile", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/profiles/nonexistent`, {
+      method: "DELETE",
+    });
+    expect(result.status).toBe(404);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("not found");
+  });
+
+  it("DELETE /profiles/:name returns 400 for default profile deletion", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    // clawd is the default profile
+    const result = await realFetch(`${base}/profiles/clawd`, {
+      method: "DELETE",
+    });
+    expect(result.status).toBe(400);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("cannot delete the default profile");
+  });
+
+  it("DELETE /profiles/:name returns 400 for invalid name format", async () => {
+    const { startBrowserControlServerFromConfig } = await import("./server.js");
+    await startBrowserControlServerFromConfig();
+    const base = `http://127.0.0.1:${testPort}`;
+
+    const result = await realFetch(`${base}/profiles/Invalid-Name!`, {
+      method: "DELETE",
+    });
+    expect(result.status).toBe(400);
+    const body = (await result.json()) as { error: string };
+    expect(body.error).toContain("invalid profile name");
   });
 });

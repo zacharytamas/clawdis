@@ -2,6 +2,9 @@ import os from "node:os";
 
 import { logDebug, logWarn } from "../logger.js";
 import { getLogger } from "../logging.js";
+import { ignoreCiaoCancellationRejection } from "./bonjour-ciao.js";
+import { formatBonjourError } from "./bonjour-errors.js";
+import { registerUnhandledRejectionHandler } from "./unhandled-rejections.js";
 
 export type GatewayBonjourAdvertiser = {
   stop: () => Promise<void>;
@@ -18,7 +21,7 @@ export type GatewayBonjourAdvertiseOpts = {
 };
 
 function isDisabledByEnv() {
-  if (process.env.CLAWDIS_DISABLE_BONJOUR === "1") return true;
+  if (process.env.CLAWDBOT_DISABLE_BONJOUR === "1") return true;
   if (process.env.NODE_ENV === "test") return true;
   if (process.env.VITEST) return true;
   return false;
@@ -26,12 +29,12 @@ function isDisabledByEnv() {
 
 function safeServiceName(name: string) {
   const trimmed = name.trim();
-  return trimmed.length > 0 ? trimmed : "Clawdis";
+  return trimmed.length > 0 ? trimmed : "Clawdbot";
 }
 
 function prettifyInstanceName(name: string) {
   const normalized = name.trim().replace(/\s+/g, " ");
-  return normalized.replace(/\s+\(Clawdis\)\s*$/i, "").trim() || normalized;
+  return normalized.replace(/\s+\(Clawdbot\)\s*$/i, "").trim() || normalized;
 }
 
 type BonjourService = {
@@ -43,14 +46,6 @@ type BonjourService = {
   on: (event: string, listener: (...args: unknown[]) => void) => unknown;
   serviceState: string;
 };
-
-function formatBonjourError(err: unknown): string {
-  if (err instanceof Error) {
-    const msg = err.message || String(err);
-    return err.name && err.name !== "Error" ? `${err.name}: ${msg}` : msg;
-  }
-  return String(err);
-}
 
 function serviceSummary(label: string, svc: BonjourService): string {
   let fqdn = "unknown";
@@ -94,11 +89,11 @@ export async function startGatewayBonjourAdvertiser(
       .hostname()
       .replace(/\.local$/i, "")
       .split(".")[0]
-      .trim() || "clawdis";
+      .trim() || "clawdbot";
   const instanceName =
     typeof opts.instanceName === "string" && opts.instanceName.trim()
       ? opts.instanceName.trim()
-      : `${hostname} (Clawdis)`;
+      : `${hostname} (Clawdbot)`;
   const displayName = prettifyInstanceName(instanceName);
 
   const txtBase: Record<string, string> = {
@@ -126,7 +121,7 @@ export async function startGatewayBonjourAdvertiser(
   if (typeof opts.bridgePort === "number" && opts.bridgePort > 0) {
     const bridge = responder.createService({
       name: safeServiceName(instanceName),
-      type: "clawdis-bridge",
+      type: "clawdbot-bridge",
       protocol: Protocol.TCP,
       port: opts.bridgePort,
       domain: "local",
@@ -141,6 +136,13 @@ export async function startGatewayBonjourAdvertiser(
       label: "bridge",
       svc: bridge as unknown as BonjourService,
     });
+  }
+
+  let ciaoCancellationRejectionHandler: (() => void) | undefined;
+  if (services.length > 0) {
+    ciaoCancellationRejectionHandler = registerUnhandledRejectionHandler(
+      ignoreCiaoCancellationRejection,
+    );
   }
 
   logDebug(
@@ -254,6 +256,8 @@ export async function startGatewayBonjourAdvertiser(
         await responder.shutdown();
       } catch {
         /* ignore */
+      } finally {
+        ciaoCancellationRejectionHandler?.();
       }
     },
   };

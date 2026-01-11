@@ -47,7 +47,7 @@ export function renderCron(props: CronProps) {
           </div>
           <div class="stat">
             <div class="stat-label">Jobs</div>
-            <div class="stat-value">${props.status?.jobCount ?? "n/a"}</div>
+            <div class="stat-value">${props.status?.jobs ?? "n/a"}</div>
           </div>
           <div class="stat">
             <div class="stat-label">Next wake</div>
@@ -174,17 +174,22 @@ export function renderCron(props: CronProps) {
                   />
                 </label>
                 <label class="field">
-                  <span>Channel</span>
+                  <span>Provider</span>
                   <select
-                    .value=${props.form.channel}
+                    .value=${props.form.provider}
                     @change=${(e: Event) =>
                       props.onFormChange({
-                        channel: (e.target as HTMLSelectElement).value as CronFormState["channel"],
+                        provider: (e.target as HTMLSelectElement).value as CronFormState["provider"],
                       })}
                   >
                     <option value="last">Last</option>
                     <option value="whatsapp">WhatsApp</option>
                     <option value="telegram">Telegram</option>
+                    <option value="discord">Discord</option>
+                    <option value="slack">Slack</option>
+                    <option value="signal">Signal</option>
+                    <option value="imessage">iMessage</option>
+                    <option value="msteams">MS Teams</option>
                   </select>
                 </label>
                 <label class="field">
@@ -387,4 +392,3 @@ function renderRun(entry: CronRunLogEntry) {
     </div>
   `;
 }
-

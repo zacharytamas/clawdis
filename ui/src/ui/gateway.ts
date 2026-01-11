@@ -1,3 +1,11 @@
+import { generateUUID } from "./uuid";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+  type GatewayClientMode,
+  type GatewayClientName,
+} from "../../../src/gateway/protocol/client-info.js";
+
 export type GatewayEventFrame = {
   type: "event";
   event: string;
@@ -31,10 +39,10 @@ export type GatewayBrowserClientOptions = {
   url: string;
   token?: string;
   password?: string;
-  clientName?: string;
+  clientName?: GatewayClientName;
   clientVersion?: string;
   platform?: string;
-  mode?: string;
+  mode?: GatewayClientMode;
   instanceId?: string;
   onHello?: (hello: GatewayHelloOk) => void;
   onEvent?: (evt: GatewayEventFrame) => void;
@@ -105,13 +113,13 @@ export class GatewayBrowserClient {
           }
         : undefined;
     const params = {
-      minProtocol: 2,
-      maxProtocol: 2,
+      minProtocol: 3,
+      maxProtocol: 3,
       client: {
-        name: this.opts.clientName ?? "clawdis-control-ui",
+        id: this.opts.clientName ?? GATEWAY_CLIENT_NAMES.CONTROL_UI,
         version: this.opts.clientVersion ?? "dev",
         platform: this.opts.platform ?? navigator.platform ?? "web",
-        mode: this.opts.mode ?? "webchat",
+        mode: this.opts.mode ?? GATEWAY_CLIENT_MODES.WEBCHAT,
         instanceId: this.opts.instanceId,
       },
       caps: [],
@@ -167,7 +175,7 @@ export class GatewayBrowserClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("gateway not connected"));
     }
-    const id = crypto.randomUUID();
+    const id = generateUUID();
     const frame = { type: "req", id, method, params };
     const p = new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: (v) => resolve(v as T), reject });

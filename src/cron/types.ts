@@ -1,3 +1,5 @@
+import type { ProviderId } from "../providers/plugins/types.js";
+
 export type CronSchedule =
   | { kind: "at"; atMs: number }
   | { kind: "every"; everyMs: number; anchorMs?: number }
@@ -6,15 +8,19 @@ export type CronSchedule =
 export type CronSessionTarget = "main" | "isolated";
 export type CronWakeMode = "next-heartbeat" | "now";
 
+export type CronMessageProvider = ProviderId | "last";
+
 export type CronPayload =
   | { kind: "systemEvent"; text: string }
   | {
       kind: "agentTurn";
       message: string;
+      /** Optional model override (provider/model or alias). */
+      model?: string;
       thinking?: string;
       timeoutSeconds?: number;
       deliver?: boolean;
-      channel?: "last" | "whatsapp" | "telegram" | "discord";
+      provider?: CronMessageProvider;
       to?: string;
       bestEffortDeliver?: boolean;
     };

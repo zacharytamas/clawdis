@@ -1,3 +1,5 @@
+import com.android.build.api.variant.impl.VariantOutputImpl
+
 plugins {
   id("com.android.application")
   id("org.jetbrains.kotlin.android")
@@ -6,21 +8,21 @@ plugins {
 }
 
 android {
-  namespace = "com.steipete.clawdis.node"
+  namespace = "com.clawdbot.android"
   compileSdk = 36
 
   sourceSets {
     getByName("main") {
-      assets.srcDir(file("../../shared/ClawdisKit/Sources/ClawdisKit/Resources"))
+      assets.srcDir(file("../../shared/ClawdbotKit/Sources/ClawdbotKit/Resources"))
     }
   }
 
   defaultConfig {
-    applicationId = "com.steipete.clawdis.node"
+    applicationId = "com.clawdbot.android"
     minSdk = 31
     targetSdk = 36
-    versionCode = 1
-    versionName = "2.0.0-beta3"
+    versionCode = 20260109
+    versionName = "2026.1.9"
   }
 
   buildTypes {
@@ -47,12 +49,31 @@ android {
 
   lint {
     disable += setOf("IconLauncherShape")
+    warningsAsErrors = true
+  }
+
+  testOptions {
+    unitTests.isIncludeAndroidResources = true
   }
 }
 
+androidComponents {
+  onVariants { variant ->
+    variant.outputs
+      .filterIsInstance<VariantOutputImpl>()
+      .forEach { output ->
+        val versionName = output.versionName.orNull ?: "0"
+        val buildType = variant.buildType
+
+        val outputFileName = "clawdbot-${versionName}-${buildType}.apk"
+        output.outputFileName = outputFileName
+      }
+  }
+}
 kotlin {
   compilerOptions {
     jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    allWarningsAsErrors.set(true)
   }
 }
 
@@ -64,7 +85,7 @@ dependencies {
   implementation("androidx.core:core-ktx:1.17.0")
   implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
   implementation("androidx.activity:activity-compose:1.12.2")
-  implementation("androidx.webkit:webkit:1.14.0")
+  implementation("androidx.webkit:webkit:1.15.0")
 
   implementation("androidx.compose.ui:ui")
   implementation("androidx.compose.ui:ui-tooling-preview")
@@ -81,6 +102,7 @@ dependencies {
   implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 
   implementation("androidx.security:security-crypto:1.1.0")
+  implementation("androidx.exifinterface:exifinterface:1.4.2")
 
   // CameraX (for node.invoke camera.* parity)
   implementation("androidx.camera:camera-core:1.5.2")
@@ -96,7 +118,8 @@ dependencies {
   testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
   testImplementation("io.kotest:kotest-runner-junit5-jvm:6.0.7")
   testImplementation("io.kotest:kotest-assertions-core-jvm:6.0.7")
-  testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.13.3")
+  testImplementation("org.robolectric:robolectric:4.16")
+  testRuntimeOnly("org.junit.vintage:junit-vintage-engine:6.0.1")
 }
 
 tasks.withType<Test>().configureEach {

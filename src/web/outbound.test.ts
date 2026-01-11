@@ -8,15 +8,26 @@ vi.mock("./media.js", () => ({
   loadWebMedia: (...args: unknown[]) => loadWebMediaMock(...args),
 }));
 
-import { sendMessageWhatsApp } from "./outbound.js";
+import {
+  sendMessageWhatsApp,
+  sendPollWhatsApp,
+  sendReactionWhatsApp,
+} from "./outbound.js";
 
 describe("web outbound", () => {
   const sendComposingTo = vi.fn(async () => {});
   const sendMessage = vi.fn(async () => ({ messageId: "msg123" }));
+  const sendPoll = vi.fn(async () => ({ messageId: "poll123" }));
+  const sendReaction = vi.fn(async () => {});
 
   beforeEach(() => {
     vi.clearAllMocks();
-    setActiveWebListener({ sendComposingTo, sendMessage });
+    setActiveWebListener({
+      sendComposingTo,
+      sendMessage,
+      sendPoll,
+      sendReaction,
+    });
   });
 
   afterEach(() => {
@@ -38,6 +49,19 @@ describe("web outbound", () => {
       undefined,
       undefined,
     );
+  });
+
+  it("throws a helpful error when no active listener exists", async () => {
+    setActiveWebListener(null);
+    await expect(
+      sendMessageWhatsApp("+1555", "hi", { verbose: false, accountId: "work" }),
+    ).rejects.toThrow(/No active WhatsApp Web listener/);
+    await expect(
+      sendMessageWhatsApp("+1555", "hi", { verbose: false, accountId: "work" }),
+    ).rejects.toThrow(/providers login/);
+    await expect(
+      sendMessageWhatsApp("+1555", "hi", { verbose: false, accountId: "work" }),
+    ).rejects.toThrow(/account: work/);
   });
 
   it("maps audio to PTT with opus mime when ogg", async () => {
@@ -78,6 +102,27 @@ describe("web outbound", () => {
     );
   });
 
+  it("marks gif playback for video when requested", async () => {
+    const buf = Buffer.from("gifvid");
+    loadWebMediaMock.mockResolvedValueOnce({
+      buffer: buf,
+      contentType: "video/mp4",
+      kind: "video",
+    });
+    await sendMessageWhatsApp("+1555", "gif", {
+      verbose: false,
+      mediaUrl: "/tmp/anim.mp4",
+      gifPlayback: true,
+    });
+    expect(sendMessage).toHaveBeenLastCalledWith(
+      "+1555",
+      "gif",
+      buf,
+      "video/mp4",
+      { gifPlayback: true },
+    );
+  });
+
   it("maps image with caption", async () => {
     const buf = Buffer.from("img");
     loadWebMediaMock.mockResolvedValueOnce({
@@ -114,6 +159,38 @@ describe("web outbound", () => {
       "doc",
       buf,
       "application/pdf",
+    );
+  });
+
+  it("sends polls via active listener", async () => {
+    const result = await sendPollWhatsApp(
+      "+1555",
+      { question: "Lunch?", options: ["Pizza", "Sushi"], maxSelections: 2 },
+      { verbose: false },
+    );
+    expect(result).toEqual({
+      messageId: "poll123",
+      toJid: "1555@s.whatsapp.net",
+    });
+    expect(sendPoll).toHaveBeenCalledWith("+1555", {
+      question: "Lunch?",
+      options: ["Pizza", "Sushi"],
+      maxSelections: 2,
+      durationHours: undefined,
+    });
+  });
+
+  it("sends reactions via active listener", async () => {
+    await sendReactionWhatsApp("1555@s.whatsapp.net", "msg123", "✅", {
+      verbose: false,
+      fromMe: false,
+    });
+    expect(sendReaction).toHaveBeenCalledWith(
+      "1555@s.whatsapp.net",
+      "msg123",
+      "✅",
+      false,
+      undefined,
     );
   });
 });

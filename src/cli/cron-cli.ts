@@ -1,8 +1,17 @@
 import type { Command } from "commander";
+import type { CronJob, CronSchedule } from "../cron/types.js";
 import { danger } from "../globals.js";
+import { listProviderPlugins } from "../providers/plugins/index.js";
 import { defaultRuntime } from "../runtime.js";
+import { formatDocsLink } from "../terminal/links.js";
+import { colorize, isRich, theme } from "../terminal/theme.js";
 import type { GatewayRpcOpts } from "./gateway-rpc.js";
 import { addGatewayClientOptions, callGatewayFromCli } from "./gateway-rpc.js";
+
+const CRON_PROVIDER_OPTIONS = [
+  "last",
+  ...listProviderPlugins().map((plugin) => plugin.id),
+].join("|");
 
 async function warnIfCronSchedulerDisabled(opts: GatewayRpcOpts) {
   try {
@@ -59,6 +68,134 @@ function parseAtMs(input: string): number | null {
   return null;
 }
 
+const CRON_ID_PAD = 36;
+const CRON_NAME_PAD = 24;
+const CRON_SCHEDULE_PAD = 32;
+const CRON_NEXT_PAD = 10;
+const CRON_LAST_PAD = 10;
+const CRON_STATUS_PAD = 9;
+const CRON_TARGET_PAD = 9;
+
+const pad = (value: string, width: number) => value.padEnd(width);
+
+const truncate = (value: string, width: number) => {
+  if (value.length <= width) return value;
+  if (width <= 3) return value.slice(0, width);
+  return `${value.slice(0, width - 3)}...`;
+};
+
+const formatIsoMinute = (ms: number) => {
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "-";
+  const iso = d.toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)}Z`;
+};
+
+const formatDuration = (ms: number) => {
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
+};
+
+const formatSpan = (ms: number) => {
+  if (ms < 60_000) return "<1m";
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
+};
+
+const formatRelative = (ms: number | null | undefined, nowMs: number) => {
+  if (!ms) return "-";
+  const delta = ms - nowMs;
+  const label = formatSpan(Math.abs(delta));
+  return delta >= 0 ? `in ${label}` : `${label} ago`;
+};
+
+const formatSchedule = (schedule: CronSchedule) => {
+  if (schedule.kind === "at") return `at ${formatIsoMinute(schedule.atMs)}`;
+  if (schedule.kind === "every")
+    return `every ${formatDuration(schedule.everyMs)}`;
+  return schedule.tz
+    ? `cron ${schedule.expr} @ ${schedule.tz}`
+    : `cron ${schedule.expr}`;
+};
+
+const formatStatus = (job: CronJob) => {
+  if (!job.enabled) return "disabled";
+  if (job.state.runningAtMs) return "running";
+  return job.state.lastStatus ?? "idle";
+};
+
+function printCronList(jobs: CronJob[], runtime = defaultRuntime) {
+  if (jobs.length === 0) {
+    runtime.log("No cron jobs.");
+    return;
+  }
+
+  const rich = isRich();
+  const header = [
+    pad("ID", CRON_ID_PAD),
+    pad("Name", CRON_NAME_PAD),
+    pad("Schedule", CRON_SCHEDULE_PAD),
+    pad("Next", CRON_NEXT_PAD),
+    pad("Last", CRON_LAST_PAD),
+    pad("Status", CRON_STATUS_PAD),
+    pad("Target", CRON_TARGET_PAD),
+  ].join(" ");
+
+  runtime.log(rich ? theme.heading(header) : header);
+  const now = Date.now();
+
+  for (const job of jobs) {
+    const idLabel = pad(job.id, CRON_ID_PAD);
+    const nameLabel = pad(truncate(job.name, CRON_NAME_PAD), CRON_NAME_PAD);
+    const scheduleLabel = pad(
+      truncate(formatSchedule(job.schedule), CRON_SCHEDULE_PAD),
+      CRON_SCHEDULE_PAD,
+    );
+    const nextLabel = pad(
+      job.enabled ? formatRelative(job.state.nextRunAtMs, now) : "-",
+      CRON_NEXT_PAD,
+    );
+    const lastLabel = pad(
+      formatRelative(job.state.lastRunAtMs, now),
+      CRON_LAST_PAD,
+    );
+    const statusRaw = formatStatus(job);
+    const statusLabel = pad(statusRaw, CRON_STATUS_PAD);
+    const targetLabel = pad(job.sessionTarget, CRON_TARGET_PAD);
+
+    const coloredStatus = (() => {
+      if (statusRaw === "ok") return colorize(rich, theme.success, statusLabel);
+      if (statusRaw === "error")
+        return colorize(rich, theme.error, statusLabel);
+      if (statusRaw === "running")
+        return colorize(rich, theme.warn, statusLabel);
+      if (statusRaw === "skipped")
+        return colorize(rich, theme.muted, statusLabel);
+      return colorize(rich, theme.muted, statusLabel);
+    })();
+
+    const coloredTarget =
+      job.sessionTarget === "isolated"
+        ? colorize(rich, theme.accentBright, targetLabel)
+        : colorize(rich, theme.accent, targetLabel);
+
+    const line = [
+      colorize(rich, theme.accent, idLabel),
+      colorize(rich, theme.info, nameLabel),
+      colorize(rich, theme.info, scheduleLabel),
+      colorize(rich, theme.muted, nextLabel),
+      colorize(rich, theme.muted, lastLabel),
+      coloredStatus,
+      coloredTarget,
+    ].join(" ");
+
+    runtime.log(line.trimEnd());
+  }
+}
+
 export function registerCronCli(program: Command) {
   addGatewayClientOptions(
     program
@@ -91,7 +228,15 @@ export function registerCronCli(program: Command) {
 
   const cron = program
     .command("cron")
-    .description("Manage cron jobs (via Gateway)");
+    .description("Manage cron jobs (via Gateway)")
+    .addHelpText(
+      "after",
+      () =>
+        `\n${theme.muted("Docs:")} ${formatDocsLink(
+          "/cron-jobs",
+          "docs.clawd.bot/cron-jobs",
+        )}\n`,
+    );
 
   addGatewayClientOptions(
     cron
@@ -120,7 +265,12 @@ export function registerCronCli(program: Command) {
           const res = await callGatewayFromCli("cron.list", opts, {
             includeDisabled: Boolean(opts.all),
           });
-          defaultRuntime.log(JSON.stringify(res, null, 2));
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify(res, null, 2));
+            return;
+          }
+          const jobs = (res as { jobs?: CronJob[] } | null)?.jobs ?? [];
+          printCronList(jobs, defaultRuntime);
         } catch (err) {
           defaultRuntime.error(danger(String(err)));
           defaultRuntime.exit(1);
@@ -131,6 +281,7 @@ export function registerCronCli(program: Command) {
   addGatewayClientOptions(
     cron
       .command("add")
+      .alias("create")
       .description("Add a cron job")
       .requiredOption("--name <name>", "Job name")
       .option("--description <text>", "Optional description")
@@ -151,11 +302,15 @@ export function registerCronCli(program: Command) {
         "--thinking <level>",
         "Thinking level for agent jobs (off|minimal|low|medium|high)",
       )
+      .option(
+        "--model <model>",
+        "Model override for agent jobs (provider/model or alias)",
+      )
       .option("--timeout-seconds <n>", "Timeout seconds for agent jobs")
       .option("--deliver", "Deliver agent output", false)
       .option(
-        "--channel <channel>",
-        "Delivery channel (last|whatsapp|telegram|discord)",
+        "--provider <provider>",
+        `Delivery provider (${CRON_PROVIDER_OPTIONS})`,
         "last",
       )
       .option(
@@ -246,6 +401,10 @@ export function registerCronCli(program: Command) {
             return {
               kind: "agentTurn" as const,
               message,
+              model:
+                typeof opts.model === "string" && opts.model.trim()
+                  ? opts.model.trim()
+                  : undefined,
               thinking:
                 typeof opts.thinking === "string" && opts.thinking.trim()
                   ? opts.thinking.trim()
@@ -255,7 +414,8 @@ export function registerCronCli(program: Command) {
                   ? timeoutSeconds
                   : undefined,
               deliver: Boolean(opts.deliver),
-              channel: typeof opts.channel === "string" ? opts.channel : "last",
+              provider:
+                typeof opts.provider === "string" ? opts.provider : "last",
               to:
                 typeof opts.to === "string" && opts.to.trim()
                   ? opts.to.trim()
@@ -314,6 +474,8 @@ export function registerCronCli(program: Command) {
   addGatewayClientOptions(
     cron
       .command("rm")
+      .alias("remove")
+      .alias("delete")
       .description("Remove a cron job")
       .argument("<id>", "Job id")
       .option("--json", "Output JSON", false)
@@ -410,11 +572,12 @@ export function registerCronCli(program: Command) {
       .option("--system-event <text>", "Set systemEvent payload")
       .option("--message <text>", "Set agentTurn payload message")
       .option("--thinking <level>", "Thinking level for agent jobs")
+      .option("--model <model>", "Model override for agent jobs")
       .option("--timeout-seconds <n>", "Timeout seconds for agent jobs")
       .option("--deliver", "Deliver agent output", false)
       .option(
-        "--channel <channel>",
-        "Delivery channel (last|whatsapp|telegram|discord)",
+        "--provider <provider>",
+        `Delivery provider (${CRON_PROVIDER_OPTIONS})`,
       )
       .option(
         "--to <dest>",
@@ -489,21 +652,29 @@ export function registerCronCli(program: Command) {
               text: String(opts.systemEvent),
             };
           } else if (opts.message) {
+            const model =
+              typeof opts.model === "string" && opts.model.trim()
+                ? opts.model.trim()
+                : undefined;
+            const thinking =
+              typeof opts.thinking === "string" && opts.thinking.trim()
+                ? opts.thinking.trim()
+                : undefined;
             const timeoutSeconds = opts.timeoutSeconds
               ? Number.parseInt(String(opts.timeoutSeconds), 10)
               : undefined;
             patch.payload = {
               kind: "agentTurn",
               message: String(opts.message),
-              thinking:
-                typeof opts.thinking === "string" ? opts.thinking : undefined,
+              model,
+              thinking,
               timeoutSeconds:
                 timeoutSeconds && Number.isFinite(timeoutSeconds)
                   ? timeoutSeconds
                   : undefined,
               deliver: Boolean(opts.deliver),
-              channel:
-                typeof opts.channel === "string" ? opts.channel : undefined,
+              provider:
+                typeof opts.provider === "string" ? opts.provider : undefined,
               to: typeof opts.to === "string" ? opts.to : undefined,
               bestEffortDeliver: Boolean(opts.bestEffortDeliver),
             };

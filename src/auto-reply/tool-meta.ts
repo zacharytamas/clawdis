@@ -1,20 +1,20 @@
-export const TOOL_RESULT_DEBOUNCE_MS = 500;
-export const TOOL_RESULT_FLUSH_COUNT = 5;
+import {
+  formatToolSummary,
+  resolveToolDisplay,
+} from "../agents/tool-display.js";
+import { shortenHomeInString, shortenHomePath } from "../utils.js";
 
 export function shortenPath(p: string): string {
-  const home = process.env.HOME;
-  if (home && (p === home || p.startsWith(`${home}/`)))
-    return p.replace(home, "~");
-  return p;
+  return shortenHomePath(p);
 }
 
 export function shortenMeta(meta: string): string {
   if (!meta) return meta;
   const colonIdx = meta.indexOf(":");
-  if (colonIdx === -1) return shortenPath(meta);
+  if (colonIdx === -1) return shortenHomeInString(meta);
   const base = meta.slice(0, colonIdx);
   const rest = meta.slice(colonIdx);
-  return `${shortenPath(base)}${rest}`;
+  return `${shortenHomeInString(base)}${rest}`;
 }
 
 export function formatToolAggregate(
@@ -22,14 +22,18 @@ export function formatToolAggregate(
   metas?: string[],
 ): string {
   const filtered = (metas ?? []).filter(Boolean).map(shortenMeta);
-  const label = toolName?.trim() || "tool";
-  const prefix = `[🛠️ ${label}]`;
+  const display = resolveToolDisplay({ name: toolName });
+  const prefix = `${display.emoji} ${display.label}`;
   if (!filtered.length) return prefix;
 
   const rawSegments: string[] = [];
   // Group by directory and brace-collapse filenames
   const grouped: Record<string, string[]> = {};
   for (const m of filtered) {
+    if (!isPathLike(m)) {
+      rawSegments.push(m);
+      continue;
+    }
     if (m.includes("→")) {
       rawSegments.push(m);
       continue;
@@ -53,41 +57,20 @@ export function formatToolAggregate(
   });
 
   const allSegments = [...rawSegments, ...segments];
-  return `${prefix} ${allSegments.join("; ")}`;
+  return `${prefix}: ${allSegments.join("; ")}`;
 }
 
 export function formatToolPrefix(toolName?: string, meta?: string) {
-  const label = toolName?.trim() || "tool";
   const extra = meta?.trim() ? shortenMeta(meta) : undefined;
-  return extra ? `[🛠️ ${label} ${extra}]` : `[🛠️ ${label}]`;
+  const display = resolveToolDisplay({ name: toolName, meta: extra });
+  return formatToolSummary(display);
 }
 
-export function createToolDebouncer(
-  onFlush: (toolName: string | undefined, metas: string[]) => void,
-  windowMs = TOOL_RESULT_DEBOUNCE_MS,
-) {
-  let pendingTool: string | undefined;
-  let pendingMetas: string[] = [];
-  let timer: NodeJS.Timeout | null = null;
-
-  const flush = () => {
-    if (!pendingTool && pendingMetas.length === 0) return;
-    onFlush(pendingTool, pendingMetas);
-    pendingTool = undefined;
-    pendingMetas = [];
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-  };
-
-  const push = (toolName?: string, meta?: string) => {
-    if (pendingTool && toolName && pendingTool !== toolName) flush();
-    if (!pendingTool) pendingTool = toolName;
-    if (meta) pendingMetas.push(meta);
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(flush, windowMs);
-  };
-
-  return { push, flush };
+function isPathLike(value: string): boolean {
+  if (!value) return false;
+  if (value.includes(" ")) return false;
+  if (value.includes("://")) return false;
+  if (value.includes("·")) return false;
+  if (value.includes("&&") || value.includes("||")) return false;
+  return /^~?(\/[^\s]+)+$/.test(value);
 }

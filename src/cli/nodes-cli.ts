@@ -1,6 +1,13 @@
+import fs from "node:fs/promises";
 import type { Command } from "commander";
 import { callGateway, randomIdempotencyKey } from "../gateway/call.js";
 import { defaultRuntime } from "../runtime.js";
+import { formatDocsLink } from "../terminal/links.js";
+import { theme } from "../terminal/theme.js";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../utils/message-provider.js";
 import {
   type CameraFacing,
   cameraTempPath,
@@ -12,12 +19,14 @@ import {
   canvasSnapshotTempPath,
   parseCanvasSnapshotPayload,
 } from "./nodes-canvas.js";
+import { parseEnvPairs, parseTimeoutMs } from "./nodes-run.js";
 import {
   parseScreenRecordPayload,
   screenRecordTempPath,
   writeScreenRecordToFile,
 } from "./nodes-screen.js";
 import { parseDurationMs } from "./parse-duration.js";
+import { withProgress } from "./progress.js";
 
 type NodesRpcOpts = {
   url?: string;
@@ -29,6 +38,14 @@ type NodesRpcOpts = {
   params?: string;
   invokeTimeout?: string;
   idempotencyKey?: string;
+  target?: string;
+  x?: string;
+  y?: string;
+  width?: string;
+  height?: string;
+  js?: string;
+  jsonl?: string;
+  text?: string;
   cwd?: string;
   env?: string[];
   commandTimeout?: string;
@@ -43,6 +60,11 @@ type NodesRpcOpts = {
   format?: string;
   maxWidth?: string;
   quality?: string;
+  delayMs?: string;
+  deviceId?: string;
+  maxAge?: string;
+  accuracy?: string;
+  locationTimeout?: string;
   duration?: string;
   screen?: string;
   fps?: string;
@@ -92,9 +114,22 @@ type PairingList = {
   paired: PairedNode[];
 };
 
+const A2UI_ACTION_KEYS = [
+  "beginRendering",
+  "surfaceUpdate",
+  "dataModelUpdate",
+  "deleteSurface",
+  "createSurface",
+] as const;
+
+type A2UIVersion = "v0.8" | "v0.9";
+
 const nodesCallOpts = (cmd: Command, defaults?: { timeoutMs?: number }) =>
   cmd
-    .option("--url <url>", "Gateway WebSocket URL", "ws://127.0.0.1:18789")
+    .option(
+      "--url <url>",
+      "Gateway WebSocket URL (defaults to gateway.remote.url when configured)",
+    )
     .option("--token <token>", "Gateway token (if required)")
     .option(
       "--timeout <ms>",
@@ -108,15 +143,23 @@ const callGatewayCli = async (
   opts: NodesRpcOpts,
   params?: unknown,
 ) =>
-  callGateway({
-    url: opts.url,
-    token: opts.token,
-    method,
-    params,
-    timeoutMs: Number(opts.timeout ?? 10_000),
-    clientName: "cli",
-    mode: "cli",
-  });
+  withProgress(
+    {
+      label: `Nodes ${method}`,
+      indeterminate: true,
+      enabled: opts.json !== true,
+    },
+    async () =>
+      await callGateway({
+        url: opts.url,
+        token: opts.token,
+        method,
+        params,
+        timeoutMs: Number(opts.timeout ?? 10_000),
+        clientName: GATEWAY_CLIENT_NAMES.CLI,
+        mode: GATEWAY_CLIENT_MODES.CLI,
+      }),
+  );
 
 function formatAge(msAgo: number) {
   const s = Math.max(0, Math.floor(msAgo / 1000));
@@ -186,20 +229,6 @@ function normalizeNodeKey(value: string) {
     .replace(/-+$/, "");
 }
 
-function parseEnvPairs(pairs: string[] | undefined) {
-  if (!Array.isArray(pairs) || pairs.length === 0) return undefined;
-  const env: Record<string, string> = {};
-  for (const pair of pairs) {
-    const idx = pair.indexOf("=");
-    if (idx <= 0) continue;
-    const key = pair.slice(0, idx).trim();
-    const value = pair.slice(idx + 1);
-    if (!key) continue;
-    env[key] = value;
-  }
-  return Object.keys(env).length > 0 ? env : undefined;
-}
-
 async function resolveNodeId(opts: NodesRpcOpts, query: string) {
   const q = String(query ?? "").trim();
   if (!q) throw new Error("node required");
@@ -245,10 +274,98 @@ async function resolveNodeId(opts: NodesRpcOpts, query: string) {
   );
 }
 
+function buildA2UITextJsonl(text: string) {
+  const surfaceId = "main";
+  const rootId = "root";
+  const textId = "text";
+  const payloads = [
+    {
+      surfaceUpdate: {
+        surfaceId,
+        components: [
+          {
+            id: rootId,
+            component: { Column: { children: { explicitList: [textId] } } },
+          },
+          {
+            id: textId,
+            component: {
+              Text: { text: { literalString: text }, usageHint: "body" },
+            },
+          },
+        ],
+      },
+    },
+    { beginRendering: { surfaceId, root: rootId } },
+  ];
+  return payloads.map((payload) => JSON.stringify(payload)).join("\n");
+}
+
+function validateA2UIJsonl(jsonl: string) {
+  const lines = jsonl.split(/\r?\n/);
+  const errors: string[] = [];
+  let sawV08 = false;
+  let sawV09 = false;
+  let messageCount = 0;
+
+  lines.forEach((line, idx) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    messageCount += 1;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed) as unknown;
+    } catch (err) {
+      errors.push(`line ${idx + 1}: ${String(err)}`);
+      return;
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+      errors.push(`line ${idx + 1}: expected JSON object`);
+      return;
+    }
+    const record = obj as Record<string, unknown>;
+    const actionKeys = A2UI_ACTION_KEYS.filter((key) => key in record);
+    if (actionKeys.length !== 1) {
+      errors.push(
+        `line ${idx + 1}: expected exactly one action key (${A2UI_ACTION_KEYS.join(
+          ", ",
+        )})`,
+      );
+      return;
+    }
+    if (actionKeys[0] === "createSurface") {
+      sawV09 = true;
+    } else {
+      sawV08 = true;
+    }
+  });
+
+  if (messageCount === 0) {
+    errors.push("no JSONL messages found");
+  }
+  if (sawV08 && sawV09) {
+    errors.push("mixed A2UI v0.8 and v0.9 messages in one file");
+  }
+  if (errors.length > 0) {
+    throw new Error(`Invalid A2UI JSONL:\n- ${errors.join("\n- ")}`);
+  }
+
+  const version: A2UIVersion = sawV09 ? "v0.9" : "v0.8";
+  return { version, messageCount };
+}
+
 export function registerNodesCli(program: Command) {
   const nodes = program
     .command("nodes")
-    .description("Manage gateway-owned node pairing");
+    .description("Manage gateway-owned node pairing")
+    .addHelpText(
+      "after",
+      () =>
+        `\n${theme.muted("Docs:")} ${formatDocsLink(
+          "/nodes",
+          "docs.clawd.bot/nodes",
+        )}\n`,
+    );
 
   nodesCallOpts(
     nodes
@@ -590,12 +707,8 @@ export function registerNodesCli(program: Command) {
             throw new Error("command required");
           }
           const env = parseEnvPairs(opts.env);
-          const timeoutMs = opts.commandTimeout
-            ? Number.parseInt(String(opts.commandTimeout), 10)
-            : undefined;
-          const invokeTimeout = opts.invokeTimeout
-            ? Number.parseInt(String(opts.invokeTimeout), 10)
-            : undefined;
+          const timeoutMs = parseTimeoutMs(opts.commandTimeout);
+          const invokeTimeout = parseTimeoutMs(opts.invokeTimeout);
 
           const invokeParams: Record<string, unknown> = {
             nodeId,
@@ -604,17 +717,14 @@ export function registerNodesCli(program: Command) {
               command,
               cwd: opts.cwd,
               env,
-              timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : undefined,
+              timeoutMs,
               needsScreenRecording: opts.needsScreenRecording === true,
             },
             idempotencyKey: String(
               opts.idempotencyKey ?? randomIdempotencyKey(),
             ),
           };
-          if (
-            typeof invokeTimeout === "number" &&
-            Number.isFinite(invokeTimeout)
-          ) {
+          if (invokeTimeout !== undefined) {
             invokeParams.timeoutMs = invokeTimeout;
           }
 
@@ -753,6 +863,25 @@ export function registerNodesCli(program: Command) {
     .command("canvas")
     .description("Capture or render canvas content from a paired node");
 
+  const invokeCanvas = async (
+    opts: NodesRpcOpts,
+    command: string,
+    params?: Record<string, unknown>,
+  ) => {
+    const nodeId = await resolveNodeId(opts, String(opts.node ?? ""));
+    const invokeParams: Record<string, unknown> = {
+      nodeId,
+      command,
+      params,
+      idempotencyKey: randomIdempotencyKey(),
+    };
+    const timeoutMs = parseTimeoutMs(opts.invokeTimeout);
+    if (typeof timeoutMs === "number") {
+      invokeParams.timeoutMs = timeoutMs;
+    }
+    return await callGatewayCli("node.invoke", opts, invokeParams);
+  };
+
   nodesCallOpts(
     canvas
       .command("snapshot")
@@ -844,13 +973,250 @@ export function registerNodesCli(program: Command) {
   );
 
   nodesCallOpts(
+    canvas
+      .command("present")
+      .description("Show the canvas (optionally with a target URL/path)")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .option("--target <urlOrPath>", "Target URL/path (optional)")
+      .option("--x <px>", "Placement x coordinate")
+      .option("--y <px>", "Placement y coordinate")
+      .option("--width <px>", "Placement width")
+      .option("--height <px>", "Placement height")
+      .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
+      .action(async (opts: NodesRpcOpts) => {
+        try {
+          const placement = {
+            x: opts.x ? Number.parseFloat(opts.x) : undefined,
+            y: opts.y ? Number.parseFloat(opts.y) : undefined,
+            width: opts.width ? Number.parseFloat(opts.width) : undefined,
+            height: opts.height ? Number.parseFloat(opts.height) : undefined,
+          };
+          const params: Record<string, unknown> = {};
+          if (opts.target) params.url = String(opts.target);
+          if (
+            Number.isFinite(placement.x) ||
+            Number.isFinite(placement.y) ||
+            Number.isFinite(placement.width) ||
+            Number.isFinite(placement.height)
+          ) {
+            params.placement = placement;
+          }
+          await invokeCanvas(opts, "canvas.present", params);
+          if (!opts.json) {
+            defaultRuntime.log("canvas present ok");
+          }
+        } catch (err) {
+          defaultRuntime.error(`nodes canvas present failed: ${String(err)}`);
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  nodesCallOpts(
+    canvas
+      .command("hide")
+      .description("Hide the canvas")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
+      .action(async (opts: NodesRpcOpts) => {
+        try {
+          await invokeCanvas(opts, "canvas.hide", undefined);
+          if (!opts.json) {
+            defaultRuntime.log("canvas hide ok");
+          }
+        } catch (err) {
+          defaultRuntime.error(`nodes canvas hide failed: ${String(err)}`);
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  nodesCallOpts(
+    canvas
+      .command("navigate")
+      .description("Navigate the canvas to a URL")
+      .argument("<url>", "Target URL/path")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
+      .action(async (url: string, opts: NodesRpcOpts) => {
+        try {
+          await invokeCanvas(opts, "canvas.navigate", { url });
+          if (!opts.json) {
+            defaultRuntime.log("canvas navigate ok");
+          }
+        } catch (err) {
+          defaultRuntime.error(`nodes canvas navigate failed: ${String(err)}`);
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  nodesCallOpts(
+    canvas
+      .command("eval")
+      .description("Evaluate JavaScript in the canvas")
+      .argument("[js]", "JavaScript to evaluate")
+      .option("--js <code>", "JavaScript to evaluate")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
+      .action(async (jsArg: string | undefined, opts: NodesRpcOpts) => {
+        try {
+          const js = opts.js ?? jsArg;
+          if (!js) throw new Error("missing --js or <js>");
+          const raw = await invokeCanvas(opts, "canvas.eval", {
+            javaScript: js,
+          });
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify(raw, null, 2));
+            return;
+          }
+          const payload =
+            typeof raw === "object" && raw !== null
+              ? (raw as { payload?: { result?: string } }).payload
+              : undefined;
+          if (payload?.result) {
+            defaultRuntime.log(payload.result);
+          } else {
+            defaultRuntime.log("canvas eval ok");
+          }
+        } catch (err) {
+          defaultRuntime.error(`nodes canvas eval failed: ${String(err)}`);
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  const a2ui = canvas
+    .command("a2ui")
+    .description("Render A2UI content on the canvas");
+
+  nodesCallOpts(
+    a2ui
+      .command("push")
+      .description("Push A2UI JSONL to the canvas")
+      .option("--jsonl <path>", "Path to JSONL payload")
+      .option("--text <text>", "Render a quick A2UI text payload")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
+      .action(async (opts: NodesRpcOpts) => {
+        try {
+          const hasJsonl = Boolean(opts.jsonl);
+          const hasText = typeof opts.text === "string";
+          if (hasJsonl === hasText) {
+            throw new Error("provide exactly one of --jsonl or --text");
+          }
+
+          const jsonl = hasText
+            ? buildA2UITextJsonl(String(opts.text ?? ""))
+            : await fs.readFile(String(opts.jsonl), "utf8");
+          const { version, messageCount } = validateA2UIJsonl(jsonl);
+          if (version === "v0.9") {
+            throw new Error(
+              "Detected A2UI v0.9 JSONL (createSurface). Clawdbot currently supports v0.8 only.",
+            );
+          }
+          await invokeCanvas(opts, "canvas.a2ui.pushJSONL", { jsonl });
+          if (!opts.json) {
+            defaultRuntime.log(
+              `canvas a2ui push ok (v0.8, ${messageCount} message${messageCount === 1 ? "" : "s"})`,
+            );
+          }
+        } catch (err) {
+          defaultRuntime.error(`nodes canvas a2ui push failed: ${String(err)}`);
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  nodesCallOpts(
+    a2ui
+      .command("reset")
+      .description("Reset A2UI renderer state")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .option("--invoke-timeout <ms>", "Node invoke timeout in ms")
+      .action(async (opts: NodesRpcOpts) => {
+        try {
+          await invokeCanvas(opts, "canvas.a2ui.reset", undefined);
+          if (!opts.json) {
+            defaultRuntime.log("canvas a2ui reset ok");
+          }
+        } catch (err) {
+          defaultRuntime.error(
+            `nodes canvas a2ui reset failed: ${String(err)}`,
+          );
+          defaultRuntime.exit(1);
+        }
+      }),
+  );
+
+  nodesCallOpts(
+    camera
+      .command("list")
+      .description("List available cameras on a node")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .action(async (opts: NodesRpcOpts) => {
+        try {
+          const nodeId = await resolveNodeId(opts, String(opts.node ?? ""));
+          const raw = (await callGatewayCli("node.invoke", opts, {
+            nodeId,
+            command: "camera.list",
+            params: {},
+            idempotencyKey: randomIdempotencyKey(),
+          })) as unknown;
+
+          const res =
+            typeof raw === "object" && raw !== null
+              ? (raw as { payload?: unknown })
+              : {};
+          const payload =
+            typeof res.payload === "object" && res.payload !== null
+              ? (res.payload as { devices?: unknown })
+              : {};
+          const devices = Array.isArray(payload.devices)
+            ? (payload.devices as Array<Record<string, unknown>>)
+            : [];
+
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify({ devices }, null, 2));
+            return;
+          }
+
+          if (devices.length === 0) {
+            defaultRuntime.log("No cameras reported.");
+            return;
+          }
+
+          for (const device of devices) {
+            const id = typeof device.id === "string" ? device.id : "";
+            const name =
+              typeof device.name === "string" ? device.name : "Unknown Camera";
+            const position =
+              typeof device.position === "string"
+                ? device.position
+                : "unspecified";
+            defaultRuntime.log(`${name} (${position})${id ? ` — ${id}` : ""}`);
+          }
+        } catch (err) {
+          defaultRuntime.error(`nodes camera list failed: ${String(err)}`);
+          defaultRuntime.exit(1);
+        }
+      }),
+    { timeoutMs: 60_000 },
+  );
+
+  nodesCallOpts(
     camera
       .command("snap")
       .description("Capture a photo from a node camera (prints MEDIA:<path>)")
       .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
       .option("--facing <front|back|both>", "Camera facing", "both")
+      .option("--device-id <id>", "Camera device id (from nodes camera list)")
       .option("--max-width <px>", "Max width in px (optional)")
       .option("--quality <0-1>", "JPEG quality (default 0.9)")
+      .option(
+        "--delay-ms <ms>",
+        "Delay before capture in ms (macOS default 2000)",
+      )
       .option(
         "--invoke-timeout <ms>",
         "Node invoke timeout in ms (default 20000)",
@@ -879,6 +1245,12 @@ export function registerNodesCli(program: Command) {
           const quality = opts.quality
             ? Number.parseFloat(String(opts.quality))
             : undefined;
+          const delayMs = opts.delayMs
+            ? Number.parseInt(String(opts.delayMs), 10)
+            : undefined;
+          const deviceId = opts.deviceId
+            ? String(opts.deviceId).trim()
+            : undefined;
           const timeoutMs = opts.invokeTimeout
             ? Number.parseInt(String(opts.invokeTimeout), 10)
             : undefined;
@@ -899,6 +1271,8 @@ export function registerNodesCli(program: Command) {
                 maxWidth: Number.isFinite(maxWidth) ? maxWidth : undefined,
                 quality: Number.isFinite(quality) ? quality : undefined,
                 format: "jpg",
+                delayMs: Number.isFinite(delayMs) ? delayMs : undefined,
+                deviceId: deviceId || undefined,
               },
               idempotencyKey: randomIdempotencyKey(),
             };
@@ -952,6 +1326,7 @@ export function registerNodesCli(program: Command) {
       )
       .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
       .option("--facing <front|back>", "Camera facing", "front")
+      .option("--device-id <id>", "Camera device id (from nodes camera list)")
       .option(
         "--duration <ms|10s|1m>",
         "Duration (default 3000ms; supports ms/s/m, e.g. 10s)",
@@ -972,6 +1347,9 @@ export function registerNodesCli(program: Command) {
           const timeoutMs = opts.invokeTimeout
             ? Number.parseInt(String(opts.invokeTimeout), 10)
             : undefined;
+          const deviceId = opts.deviceId
+            ? String(opts.deviceId).trim()
+            : undefined;
 
           const invokeParams: Record<string, unknown> = {
             nodeId,
@@ -981,6 +1359,7 @@ export function registerNodesCli(program: Command) {
               durationMs: Number.isFinite(durationMs) ? durationMs : undefined,
               includeAudio,
               format: "mp4",
+              deviceId: deviceId || undefined,
             },
             idempotencyKey: randomIdempotencyKey(),
           };
@@ -1125,5 +1504,102 @@ export function registerNodesCli(program: Command) {
         }
       }),
     { timeoutMs: 180_000 },
+  );
+
+  const location = nodes
+    .command("location")
+    .description("Fetch location from a paired node");
+
+  nodesCallOpts(
+    location
+      .command("get")
+      .description("Fetch the current location from a node")
+      .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
+      .option("--max-age <ms>", "Use cached location newer than this (ms)")
+      .option(
+        "--accuracy <coarse|balanced|precise>",
+        "Desired accuracy (default: balanced/precise depending on node setting)",
+      )
+      .option("--location-timeout <ms>", "Location fix timeout (ms)", "10000")
+      .option(
+        "--invoke-timeout <ms>",
+        "Node invoke timeout in ms (default 20000)",
+        "20000",
+      )
+      .action(async (opts: NodesRpcOpts) => {
+        try {
+          const nodeId = await resolveNodeId(opts, String(opts.node ?? ""));
+          const maxAgeMs = opts.maxAge
+            ? Number.parseInt(String(opts.maxAge), 10)
+            : undefined;
+          const desiredAccuracyRaw =
+            typeof opts.accuracy === "string"
+              ? opts.accuracy.trim().toLowerCase()
+              : undefined;
+          const desiredAccuracy =
+            desiredAccuracyRaw === "coarse" ||
+            desiredAccuracyRaw === "balanced" ||
+            desiredAccuracyRaw === "precise"
+              ? desiredAccuracyRaw
+              : undefined;
+          const timeoutMs = opts.locationTimeout
+            ? Number.parseInt(String(opts.locationTimeout), 10)
+            : undefined;
+          const invokeTimeoutMs = opts.invokeTimeout
+            ? Number.parseInt(String(opts.invokeTimeout), 10)
+            : undefined;
+
+          const invokeParams: Record<string, unknown> = {
+            nodeId,
+            command: "location.get",
+            params: {
+              maxAgeMs: Number.isFinite(maxAgeMs) ? maxAgeMs : undefined,
+              desiredAccuracy,
+              timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : undefined,
+            },
+            idempotencyKey: randomIdempotencyKey(),
+          };
+          if (
+            typeof invokeTimeoutMs === "number" &&
+            Number.isFinite(invokeTimeoutMs)
+          ) {
+            invokeParams.timeoutMs = invokeTimeoutMs;
+          }
+
+          const raw = (await callGatewayCli(
+            "node.invoke",
+            opts,
+            invokeParams,
+          )) as unknown;
+          const res =
+            typeof raw === "object" && raw !== null
+              ? (raw as { payload?: unknown })
+              : {};
+          const payload =
+            res.payload && typeof res.payload === "object"
+              ? (res.payload as Record<string, unknown>)
+              : {};
+
+          if (opts.json) {
+            defaultRuntime.log(JSON.stringify(payload, null, 2));
+            return;
+          }
+
+          const lat = payload.lat;
+          const lon = payload.lon;
+          const acc = payload.accuracyMeters;
+          if (typeof lat === "number" && typeof lon === "number") {
+            const accText =
+              typeof acc === "number" ? ` ±${acc.toFixed(1)}m` : "";
+            defaultRuntime.log(`${lat},${lon}${accText}`);
+            return;
+          }
+          defaultRuntime.log(JSON.stringify(payload));
+        } catch (err) {
+          defaultRuntime.error(`nodes location get failed: ${String(err)}`);
+          defaultRuntime.exit(1);
+        }
+      }),
+    { timeoutMs: 30_000 },
   );
 }

@@ -1,4 +1,4 @@
-import ClawdisKit
+import ClawdbotKit
 import Foundation
 import Network
 
@@ -14,7 +14,7 @@ actor BridgeClient {
     {
         self.lineBuffer = Data()
         let connection = NWConnection(to: endpoint, using: .tcp)
-        let queue = DispatchQueue(label: "com.steipete.clawdis.ios.bridge-client")
+        let queue = DispatchQueue(label: "com.clawdbot.ios.bridge-client")
         defer { connection.cancel() }
         try await self.withTimeout(seconds: 8, purpose: "connect") {
             try await self.startAndWaitForReady(connection, queue: queue)
@@ -161,18 +161,10 @@ actor BridgeClient {
         purpose: String,
         _ op: @escaping @Sendable () async throws -> T) async throws -> T
     {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await op()
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
-                throw TimeoutError(purpose: purpose, seconds: seconds)
-            }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
-        }
+        try await AsyncTimeout.withTimeout(
+            seconds: Double(seconds),
+            onTimeout: { TimeoutError(purpose: purpose, seconds: seconds) },
+            operation: op)
     }
 
     private func startAndWaitForReady(_ connection: NWConnection, queue: DispatchQueue) async throws {

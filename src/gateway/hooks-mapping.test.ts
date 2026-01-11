@@ -38,8 +38,32 @@ describe("hooks mapping", () => {
     }
   });
 
+  it("passes model override from mapping", async () => {
+    const mappings = resolveHookMappings({
+      mappings: [
+        {
+          id: "demo",
+          match: { path: "gmail" },
+          action: "agent",
+          messageTemplate: "Subject: {{messages[0].subject}}",
+          model: "openai/gpt-4.1-mini",
+        },
+      ],
+    });
+    const result = await applyHookMappings(mappings, {
+      payload: { messages: [{ subject: "Hello" }] },
+      headers: {},
+      url: baseUrl,
+      path: "gmail",
+    });
+    expect(result?.ok).toBe(true);
+    if (result?.ok && result.action.kind === "agent") {
+      expect(result.action.model).toBe("openai/gpt-4.1-mini");
+    }
+  });
+
   it("runs transform module", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawdis-hooks-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawdbot-hooks-"));
     const modPath = path.join(dir, "transform.mjs");
     const placeholder = "${" + "payload.name}";
     fs.writeFileSync(
@@ -71,6 +95,61 @@ describe("hooks mapping", () => {
       if (result.action.kind === "wake") {
         expect(result.action.text).toBe("Ping Ada");
       }
+    }
+  });
+
+  it("treats null transform as a handled skip", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawdbot-hooks-skip-"));
+    const modPath = path.join(dir, "transform.mjs");
+    fs.writeFileSync(modPath, "export default () => null;");
+
+    const mappings = resolveHookMappings({
+      transformsDir: dir,
+      mappings: [
+        {
+          match: { path: "skip" },
+          action: "agent",
+          transform: { module: "transform.mjs" },
+        },
+      ],
+    });
+
+    const result = await applyHookMappings(mappings, {
+      payload: {},
+      headers: {},
+      url: new URL("http://127.0.0.1:18789/hooks/skip"),
+      path: "skip",
+    });
+
+    expect(result?.ok).toBe(true);
+    if (result?.ok) {
+      expect(result.action).toBeNull();
+      expect("skipped" in result).toBe(true);
+    }
+  });
+
+  it("prefers explicit mappings over presets", async () => {
+    const mappings = resolveHookMappings({
+      presets: ["gmail"],
+      mappings: [
+        {
+          id: "override",
+          match: { path: "gmail" },
+          action: "agent",
+          messageTemplate: "Override subject: {{messages[0].subject}}",
+        },
+      ],
+    });
+    const result = await applyHookMappings(mappings, {
+      payload: { messages: [{ subject: "Hello" }] },
+      headers: {},
+      url: baseUrl,
+      path: "gmail",
+    });
+    expect(result?.ok).toBe(true);
+    if (result?.ok) {
+      expect(result.action.kind).toBe("agent");
+      expect(result.action.message).toBe("Override subject: Hello");
     }
   });
 

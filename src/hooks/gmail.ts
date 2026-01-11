@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
 
-import type {
-  ClawdisConfig,
-  HooksGmailTailscaleMode,
+import {
+  type ClawdbotConfig,
+  DEFAULT_GATEWAY_PORT,
+  type HooksGmailTailscaleMode,
+  resolveGatewayPort,
 } from "../config/config.js";
 
 export const DEFAULT_GMAIL_LABEL = "INBOX";
@@ -14,7 +16,6 @@ export const DEFAULT_GMAIL_SERVE_PATH = "/gmail-pubsub";
 export const DEFAULT_GMAIL_MAX_BYTES = 20_000;
 export const DEFAULT_GMAIL_RENEW_MINUTES = 12 * 60;
 export const DEFAULT_HOOKS_PATH = "/hooks";
-export const DEFAULT_HOOKS_BASE_URL = "http://127.0.0.1:18789";
 
 export type GmailHookOverrides = {
   account?: string;
@@ -32,6 +33,7 @@ export type GmailHookOverrides = {
   servePath?: string;
   tailscaleMode?: HooksGmailTailscaleMode;
   tailscalePath?: string;
+  tailscaleTarget?: string;
 };
 
 export type GmailHookRuntimeConfig = {
@@ -53,6 +55,7 @@ export type GmailHookRuntimeConfig = {
   tailscale: {
     mode: HooksGmailTailscaleMode;
     path: string;
+    target?: string;
   };
 };
 
@@ -87,13 +90,17 @@ export function normalizeServePath(raw?: string): string {
   return withSlash.replace(/\/+$/, "");
 }
 
-export function buildDefaultHookUrl(hooksPath?: string): string {
+export function buildDefaultHookUrl(
+  hooksPath?: string,
+  port: number = DEFAULT_GATEWAY_PORT,
+): string {
   const basePath = normalizeHooksPath(hooksPath);
-  return joinUrl(DEFAULT_HOOKS_BASE_URL, `${basePath}/gmail`);
+  const baseUrl = `http://127.0.0.1:${port}`;
+  return joinUrl(baseUrl, `${basePath}/gmail`);
 }
 
 export function resolveGmailHookRuntimeConfig(
-  cfg: ClawdisConfig,
+  cfg: ClawdbotConfig,
   overrides: GmailHookOverrides,
 ): { ok: true; value: GmailHookRuntimeConfig } | { ok: false; error: string } {
   const hooks = cfg.hooks;
@@ -122,7 +129,9 @@ export function resolveGmailHookRuntimeConfig(
   }
 
   const hookUrl =
-    overrides.hookUrl ?? gmail?.hookUrl ?? buildDefaultHookUrl(hooks?.path);
+    overrides.hookUrl ??
+    gmail?.hookUrl ??
+    buildDefaultHookUrl(hooks?.path, resolveGatewayPort(cfg));
 
   const includeBody = overrides.includeBody ?? gmail?.includeBody ?? true;
 
@@ -153,23 +162,30 @@ export function resolveGmailHookRuntimeConfig(
       ? Math.floor(servePortRaw)
       : DEFAULT_GMAIL_SERVE_PORT;
   const servePathRaw = overrides.servePath ?? gmail?.serve?.path;
-  const hasExplicitServePath =
-    typeof servePathRaw === "string" && servePathRaw.trim().length > 0;
+  const normalizedServePathRaw =
+    typeof servePathRaw === "string" && servePathRaw.trim().length > 0
+      ? normalizeServePath(servePathRaw)
+      : DEFAULT_GMAIL_SERVE_PATH;
+  const tailscaleTargetRaw =
+    overrides.tailscaleTarget ?? gmail?.tailscale?.target;
 
   const tailscaleMode =
     overrides.tailscaleMode ?? gmail?.tailscale?.mode ?? "off";
-  // When exposing the push endpoint via Tailscale, the public path is stripped
-  // before proxying; use "/" internally unless the user set a path explicitly.
+  const tailscaleTarget =
+    tailscaleMode !== "off" &&
+    typeof tailscaleTargetRaw === "string" &&
+    tailscaleTargetRaw.trim().length > 0
+      ? tailscaleTargetRaw.trim()
+      : undefined;
+  // Tailscale strips the public path before proxying, so listen on "/" when on.
   const servePath = normalizeServePath(
-    tailscaleMode !== "off" && !hasExplicitServePath ? "/" : servePathRaw,
+    tailscaleMode !== "off" && !tailscaleTarget ? "/" : normalizedServePathRaw,
   );
 
   const tailscalePathRaw = overrides.tailscalePath ?? gmail?.tailscale?.path;
   const tailscalePath = normalizeServePath(
-    tailscaleMode !== "off" && !tailscalePathRaw
-      ? hasExplicitServePath
-        ? servePathRaw
-        : DEFAULT_GMAIL_SERVE_PATH
+    tailscaleMode !== "off"
+      ? (tailscalePathRaw ?? normalizedServePathRaw)
       : (tailscalePathRaw ?? servePath),
   );
 
@@ -194,6 +210,7 @@ export function resolveGmailHookRuntimeConfig(
       tailscale: {
         mode: tailscaleMode,
         path: tailscalePath,
+        target: tailscaleTarget,
       },
     },
   };

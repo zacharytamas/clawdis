@@ -1,24 +1,33 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { isVerbose, logVerbose } from "../globals.js";
+import { logVerbose, shouldLogVerbose } from "../globals.js";
 import {
   type MediaKind,
   maxBytesForKind,
   mediaKindFromMime,
 } from "../media/constants.js";
+import { fetchRemoteMedia } from "../media/fetch.js";
 import { resizeToJpeg } from "../media/image-ops.js";
 import { detectMime, extensionForMime } from "../media/mime.js";
 
-export async function loadWebMedia(
-  mediaUrl: string,
-  maxBytes?: number,
-): Promise<{
+type WebMediaResult = {
   buffer: Buffer;
   contentType?: string;
   kind: MediaKind;
   fileName?: string;
-}> {
+};
+
+type WebMediaOptions = {
+  maxBytes?: number;
+  optimizeImages?: boolean;
+};
+
+async function loadWebMediaInternal(
+  mediaUrl: string,
+  options: WebMediaOptions = {},
+): Promise<WebMediaResult> {
+  const { maxBytes, optimizeImages = true } = options;
   if (mediaUrl.startsWith("file://")) {
     mediaUrl = mediaUrl.replace("file://", "");
   }
@@ -26,7 +35,7 @@ export async function loadWebMedia(
   const optimizeAndClampImage = async (buffer: Buffer, cap: number) => {
     const originalSize = buffer.length;
     const optimized = await optimizeImageToJpeg(buffer, cap);
-    if (optimized.optimizedSize < originalSize && isVerbose()) {
+    if (optimized.optimizedSize < originalSize && shouldLogVerbose()) {
       logVerbose(
         `Optimized media from ${(originalSize / (1024 * 1024)).toFixed(2)}MB to ${(optimized.optimizedSize / (1024 * 1024)).toFixed(2)}MB (side≤${optimized.resizeSide}px, q=${optimized.quality})`,
       );
@@ -45,50 +54,60 @@ export async function loadWebMedia(
     };
   };
 
-  if (/^https?:\/\//i.test(mediaUrl)) {
-    let fileName: string | undefined;
-    try {
-      const url = new URL(mediaUrl);
-      const base = path.basename(url.pathname);
-      fileName = base || undefined;
-    } catch {
-      // ignore parse errors; leave undefined
-    }
-    const res = await fetch(mediaUrl);
-    if (!res.ok || !res.body) {
-      throw new Error(`Failed to fetch media: HTTP ${res.status}`);
-    }
-    const array = Buffer.from(await res.arrayBuffer());
-    const contentType = await detectMime({
-      buffer: array,
-      headerMime: res.headers.get("content-type"),
-      filePath: mediaUrl,
-    });
-    if (fileName && !path.extname(fileName) && contentType) {
-      const ext = extensionForMime(contentType);
-      if (ext) fileName = `${fileName}${ext}`;
-    }
-    const kind = mediaKindFromMime(contentType);
+  const clampAndFinalize = async (params: {
+    buffer: Buffer;
+    contentType?: string;
+    kind: MediaKind;
+    fileName?: string;
+  }): Promise<WebMediaResult> => {
     const cap = Math.min(
-      maxBytes ?? maxBytesForKind(kind),
-      maxBytesForKind(kind),
+      maxBytes ?? maxBytesForKind(params.kind),
+      maxBytesForKind(params.kind),
     );
-    if (kind === "image") {
-      return { ...(await optimizeAndClampImage(array, cap)), fileName };
+    if (params.kind === "image") {
+      const isGif = params.contentType === "image/gif";
+      if (isGif || !optimizeImages) {
+        if (params.buffer.length > cap) {
+          throw new Error(
+            `${
+              isGif ? "GIF" : "Media"
+            } exceeds ${(cap / (1024 * 1024)).toFixed(0)}MB limit (got ${(
+              params.buffer.length / (1024 * 1024)
+            ).toFixed(2)}MB)`,
+          );
+        }
+        return {
+          buffer: params.buffer,
+          contentType: params.contentType,
+          kind: params.kind,
+          fileName: params.fileName,
+        };
+      }
+      return {
+        ...(await optimizeAndClampImage(params.buffer, cap)),
+        fileName: params.fileName,
+      };
     }
-    if (array.length > cap) {
+    if (params.buffer.length > cap) {
       throw new Error(
         `Media exceeds ${(cap / (1024 * 1024)).toFixed(0)}MB limit (got ${(
-          array.length / (1024 * 1024)
+          params.buffer.length / (1024 * 1024)
         ).toFixed(2)}MB)`,
       );
     }
     return {
-      buffer: array,
-      contentType: contentType ?? undefined,
-      kind,
-      fileName,
+      buffer: params.buffer,
+      contentType: params.contentType ?? undefined,
+      kind: params.kind,
+      fileName: params.fileName,
     };
+  };
+
+  if (/^https?:\/\//i.test(mediaUrl)) {
+    const fetched = await fetchRemoteMedia({ url: mediaUrl });
+    const { buffer, contentType, fileName } = fetched;
+    const kind = mediaKindFromMime(contentType);
+    return await clampAndFinalize({ buffer, contentType, kind, fileName });
   }
 
   // Local path
@@ -100,21 +119,32 @@ export async function loadWebMedia(
     const ext = extensionForMime(mime);
     if (ext) fileName = `${fileName}${ext}`;
   }
-  const cap = Math.min(
-    maxBytes ?? maxBytesForKind(kind),
-    maxBytesForKind(kind),
-  );
-  if (kind === "image") {
-    return { ...(await optimizeAndClampImage(data, cap)), fileName };
-  }
-  if (data.length > cap) {
-    throw new Error(
-      `Media exceeds ${(cap / (1024 * 1024)).toFixed(0)}MB limit (got ${(
-        data.length / (1024 * 1024)
-      ).toFixed(2)}MB)`,
-    );
-  }
-  return { buffer: data, contentType: mime, kind, fileName };
+  return await clampAndFinalize({
+    buffer: data,
+    contentType: mime,
+    kind,
+    fileName,
+  });
+}
+
+export async function loadWebMedia(
+  mediaUrl: string,
+  maxBytes?: number,
+): Promise<WebMediaResult> {
+  return await loadWebMediaInternal(mediaUrl, {
+    maxBytes,
+    optimizeImages: true,
+  });
+}
+
+export async function loadWebMediaRaw(
+  mediaUrl: string,
+  maxBytes?: number,
+): Promise<WebMediaResult> {
+  return await loadWebMediaInternal(mediaUrl, {
+    maxBytes,
+    optimizeImages: false,
+  });
 }
 
 export async function optimizeImageToJpeg(

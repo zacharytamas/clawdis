@@ -160,6 +160,14 @@ function isTestEnv() {
   return process.env.NODE_ENV === "test" || Boolean(process.env.VITEST);
 }
 
+export function configureNodeBridgeSocket(socket: {
+  setNoDelay: (noDelay?: boolean) => void;
+  setKeepAlive: (enable?: boolean, initialDelay?: number) => void;
+}) {
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 15_000);
+}
+
 function encodeLine(frame: AnyBridgeFrame) {
   return `${JSON.stringify(frame)}\n`;
 }
@@ -171,7 +179,7 @@ async function sleep(ms: number) {
 export async function startNodeBridgeServer(
   opts: NodeBridgeServerOpts,
 ): Promise<NodeBridgeServer> {
-  if (isTestEnv() && process.env.CLAWDIS_ENABLE_BRIDGE_IN_TESTS !== "1") {
+  if (isTestEnv() && process.env.CLAWDBOT_ENABLE_BRIDGE_IN_TESTS !== "1") {
     return {
       port: 0,
       close: async () => {},
@@ -228,7 +236,7 @@ export async function startNodeBridgeServer(
   const loopbackHost = "127.0.0.1";
 
   const onConnection = (socket: net.Socket) => {
-    socket.setNoDelay(true);
+    configureNodeBridgeSocket(socket);
 
     let buffer = "";
     let isAuthenticated = false;

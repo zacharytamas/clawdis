@@ -2,11 +2,160 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { hasBinary } from "../agents/skills.js";
-import { runCommandWithTimeout } from "../process/exec.js";
+import { runCommandWithTimeout, type SpawnResult } from "../process/exec.js";
 import { resolveUserPath } from "../utils.js";
 import { normalizeServePath } from "./gmail.js";
 
+let cachedPythonPath: string | null | undefined;
+const MAX_OUTPUT_CHARS = 800;
+
+function trimOutput(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.length <= MAX_OUTPUT_CHARS) return trimmed;
+  return `${trimmed.slice(0, MAX_OUTPUT_CHARS)}…`;
+}
+
+function formatCommandFailure(command: string, result: SpawnResult): string {
+  const code = result.code ?? "null";
+  const signal = result.signal ? `, signal=${result.signal}` : "";
+  const killed = result.killed ? ", killed=true" : "";
+  const stderr = trimOutput(result.stderr);
+  const stdout = trimOutput(result.stdout);
+  const lines = [`${command} failed (code=${code}${signal}${killed})`];
+  if (stderr) lines.push(`stderr: ${stderr}`);
+  if (stdout) lines.push(`stdout: ${stdout}`);
+  return lines.join("\n");
+}
+
+function formatCommandResult(command: string, result: SpawnResult): string {
+  const code = result.code ?? "null";
+  const signal = result.signal ? `, signal=${result.signal}` : "";
+  const killed = result.killed ? ", killed=true" : "";
+  const stderr = trimOutput(result.stderr);
+  const stdout = trimOutput(result.stdout);
+  const lines = [`${command} exited (code=${code}${signal}${killed})`];
+  if (stderr) lines.push(`stderr: ${stderr}`);
+  if (stdout) lines.push(`stdout: ${stdout}`);
+  return lines.join("\n");
+}
+
+function formatJsonParseFailure(
+  command: string,
+  result: SpawnResult,
+  err: unknown,
+): string {
+  const reason = err instanceof Error ? err.message : String(err);
+  return `${command} returned invalid JSON: ${reason}\n${formatCommandResult(
+    command,
+    result,
+  )}`;
+}
+
+function formatCommand(command: string, args: string[]): string {
+  return [command, ...args].join(" ");
+}
+
+function findExecutablesOnPath(bins: string[]): string[] {
+  const pathEnv = process.env.PATH ?? "";
+  const parts = pathEnv.split(path.delimiter).filter(Boolean);
+  const seen = new Set<string>();
+  const matches: string[] = [];
+  for (const part of parts) {
+    for (const bin of bins) {
+      const candidate = path.join(part, bin);
+      if (seen.has(candidate)) continue;
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        matches.push(candidate);
+        seen.add(candidate);
+      } catch {
+        // keep scanning
+      }
+    }
+  }
+  return matches;
+}
+
+function ensurePathIncludes(dirPath: string, position: "append" | "prepend") {
+  const pathEnv = process.env.PATH ?? "";
+  const parts = pathEnv.split(path.delimiter).filter(Boolean);
+  if (parts.includes(dirPath)) return;
+  const next =
+    position === "prepend" ? [dirPath, ...parts] : [...parts, dirPath];
+  process.env.PATH = next.join(path.delimiter);
+}
+
+function ensureGcloudOnPath(): boolean {
+  if (hasBinary("gcloud")) return true;
+  const candidates = [
+    "/opt/homebrew/share/google-cloud-sdk/bin/gcloud",
+    "/usr/local/share/google-cloud-sdk/bin/gcloud",
+    "/opt/homebrew/Caskroom/google-cloud-sdk/latest/google-cloud-sdk/bin/gcloud",
+    "/usr/local/Caskroom/google-cloud-sdk/latest/google-cloud-sdk/bin/gcloud",
+  ];
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      ensurePathIncludes(path.dirname(candidate), "append");
+      return true;
+    } catch {
+      // keep scanning
+    }
+  }
+  return false;
+}
+
+export async function resolvePythonExecutablePath(): Promise<
+  string | undefined
+> {
+  if (cachedPythonPath !== undefined) {
+    return cachedPythonPath ?? undefined;
+  }
+  const candidates = findExecutablesOnPath(["python3", "python"]);
+  for (const candidate of candidates) {
+    const res = await runCommandWithTimeout(
+      [
+        candidate,
+        "-c",
+        "import os, sys; print(os.path.realpath(sys.executable))",
+      ],
+      { timeoutMs: 2_000 },
+    );
+    if (res.code !== 0) continue;
+    const resolved = res.stdout.trim().split(/\s+/)[0];
+    if (!resolved) continue;
+    try {
+      fs.accessSync(resolved, fs.constants.X_OK);
+      cachedPythonPath = resolved;
+      return resolved;
+    } catch {
+      // keep scanning
+    }
+  }
+  cachedPythonPath = null;
+  return undefined;
+}
+
+async function gcloudEnv(): Promise<NodeJS.ProcessEnv | undefined> {
+  if (process.env.CLOUDSDK_PYTHON) return undefined;
+  const pythonPath = await resolvePythonExecutablePath();
+  if (!pythonPath) return undefined;
+  return { CLOUDSDK_PYTHON: pythonPath };
+}
+
+async function runGcloudCommand(
+  args: string[],
+  timeoutMs: number,
+): Promise<Awaited<ReturnType<typeof runCommandWithTimeout>>> {
+  return await runCommandWithTimeout(["gcloud", ...args], {
+    timeoutMs,
+    env: await gcloudEnv(),
+  });
+}
+
 export async function ensureDependency(bin: string, brewArgs: string[]) {
+  if (bin === "gcloud" && ensureGcloudOnPath()) return;
   if (hasBinary(bin)) return;
   if (process.platform !== "darwin") {
     throw new Error(`${bin} not installed; install it and retry`);
@@ -14,8 +163,10 @@ export async function ensureDependency(bin: string, brewArgs: string[]) {
   if (!hasBinary("brew")) {
     throw new Error("Homebrew not installed (install brew and retry)");
   }
+  const brewEnv = bin === "gcloud" ? await gcloudEnv() : undefined;
   const result = await runCommandWithTimeout(["brew", "install", ...brewArgs], {
     timeoutMs: 600_000,
+    env: brewEnv,
   });
   if (result.code !== 0) {
     throw new Error(
@@ -28,31 +179,19 @@ export async function ensureDependency(bin: string, brewArgs: string[]) {
 }
 
 export async function ensureGcloudAuth() {
-  const res = await runCommandWithTimeout(
-    [
-      "gcloud",
-      "auth",
-      "list",
-      "--filter",
-      "status:ACTIVE",
-      "--format",
-      "value(account)",
-    ],
-    { timeoutMs: 30_000 },
+  const res = await runGcloudCommand(
+    ["auth", "list", "--filter", "status:ACTIVE", "--format", "value(account)"],
+    30_000,
   );
   if (res.code === 0 && res.stdout.trim()) return;
-  const login = await runCommandWithTimeout(["gcloud", "auth", "login"], {
-    timeoutMs: 600_000,
-  });
+  const login = await runGcloudCommand(["auth", "login"], 600_000);
   if (login.code !== 0) {
     throw new Error(login.stderr || "gcloud auth login failed");
   }
 }
 
 export async function runGcloud(args: string[]) {
-  const result = await runCommandWithTimeout(["gcloud", ...args], {
-    timeoutMs: 120_000,
-  });
+  const result = await runGcloudCommand(args, 120_000);
   if (result.code !== 0) {
     throw new Error(result.stderr || result.stdout || "gcloud command failed");
   }
@@ -60,17 +199,9 @@ export async function runGcloud(args: string[]) {
 }
 
 export async function ensureTopic(projectId: string, topicName: string) {
-  const describe = await runCommandWithTimeout(
-    [
-      "gcloud",
-      "pubsub",
-      "topics",
-      "describe",
-      topicName,
-      "--project",
-      projectId,
-    ],
-    { timeoutMs: 30_000 },
+  const describe = await runGcloudCommand(
+    ["pubsub", "topics", "describe", topicName, "--project", projectId],
+    30_000,
   );
   if (describe.code === 0) return;
   await runGcloud([
@@ -89,9 +220,8 @@ export async function ensureSubscription(
   topicName: string,
   pushEndpoint: string,
 ) {
-  const describe = await runCommandWithTimeout(
+  const describe = await runGcloudCommand(
     [
-      "gcloud",
       "pubsub",
       "subscriptions",
       "describe",
@@ -99,7 +229,7 @@ export async function ensureSubscription(
       "--project",
       projectId,
     ],
-    { timeoutMs: 30_000 },
+    30_000,
   );
   if (describe.code === 0) {
     await runGcloud([
@@ -131,32 +261,42 @@ export async function ensureSubscription(
 export async function ensureTailscaleEndpoint(params: {
   mode: "off" | "serve" | "funnel";
   path: string;
-  port: number;
+  port?: number;
+  target?: string;
   token?: string;
 }): Promise<string> {
   if (params.mode === "off") return "";
 
-  const status = await runCommandWithTimeout(
-    ["tailscale", "status", "--json"],
-    {
-      timeoutMs: 30_000,
-    },
-  );
+  const statusArgs = ["status", "--json"];
+  const statusCommand = formatCommand("tailscale", statusArgs);
+  const status = await runCommandWithTimeout(["tailscale", ...statusArgs], {
+    timeoutMs: 30_000,
+  });
   if (status.code !== 0) {
-    throw new Error(status.stderr || "tailscale status failed");
+    throw new Error(formatCommandFailure(statusCommand, status));
   }
-  const parsed = JSON.parse(status.stdout) as {
-    Self?: { DNSName?: string };
-  };
+  let parsed: { Self?: { DNSName?: string } };
+  try {
+    parsed = JSON.parse(status.stdout) as { Self?: { DNSName?: string } };
+  } catch (err) {
+    throw new Error(formatJsonParseFailure(statusCommand, status, err));
+  }
   const dnsName = parsed.Self?.DNSName?.replace(/\.$/, "");
   if (!dnsName) {
     throw new Error("tailscale DNS name missing; run tailscale up");
   }
 
-  const target = String(params.port);
+  const target =
+    typeof params.target === "string" && params.target.trim().length > 0
+      ? params.target.trim()
+      : params.port
+        ? String(params.port)
+        : "";
+  if (!target) {
+    throw new Error("tailscale target missing; set a port or target URL");
+  }
   const pathArg = normalizeServePath(params.path);
   const funnelArgs = [
-    "tailscale",
     params.mode,
     "--bg",
     "--set-path",
@@ -164,11 +304,15 @@ export async function ensureTailscaleEndpoint(params: {
     "--yes",
     target,
   ];
-  const funnelResult = await runCommandWithTimeout(funnelArgs, {
-    timeoutMs: 30_000,
-  });
+  const funnelCommand = formatCommand("tailscale", funnelArgs);
+  const funnelResult = await runCommandWithTimeout(
+    ["tailscale", ...funnelArgs],
+    {
+      timeoutMs: 30_000,
+    },
+  );
   if (funnelResult.code !== 0) {
-    throw new Error(funnelResult.stderr || "tailscale funnel failed");
+    throw new Error(formatCommandFailure(funnelCommand, funnelResult));
   }
 
   const baseUrl = `https://${dnsName}${pathArg}`;
@@ -188,9 +332,8 @@ export async function resolveProjectIdFromGogCredentials(): Promise<
       const clientId = extractGogClientId(parsed);
       const projectNumber = extractProjectNumber(clientId);
       if (!projectNumber) continue;
-      const res = await runCommandWithTimeout(
+      const res = await runGcloudCommand(
         [
-          "gcloud",
           "projects",
           "list",
           "--filter",
@@ -198,7 +341,7 @@ export async function resolveProjectIdFromGogCredentials(): Promise<
           "--format",
           "value(projectId)",
         ],
-        { timeoutMs: 30_000 },
+        30_000,
       );
       if (res.code !== 0) continue;
       const projectId = res.stdout.trim().split(/\s+/)[0];

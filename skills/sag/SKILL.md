@@ -2,7 +2,7 @@
 name: sag
 description: ElevenLabs text-to-speech with mac-style say UX.
 homepage: https://sag.sh
-metadata: {"clawdis":{"emoji":"🗣️","requires":{"bins":["sag"],"env":["ELEVENLABS_API_KEY"]},"primaryEnv":"ELEVENLABS_API_KEY","install":[{"id":"brew","kind":"brew","formula":"steipete/tap/sag","bins":["sag"],"label":"Install sag (brew)"}]}}
+metadata: {"clawdbot":{"emoji":"🗣️","requires":{"bins":["sag"],"env":["ELEVENLABS_API_KEY"]},"primaryEnv":"ELEVENLABS_API_KEY","install":[{"id":"brew","kind":"brew","formula":"steipete/tap/sag","bins":["sag"],"label":"Install sag (brew)"}]}}
 ---
 
 # sag
@@ -41,3 +41,22 @@ Voice defaults
 - `ELEVENLABS_VOICE_ID` or `SAG_VOICE_ID`
 
 Confirm voice + speaker before long output.
+
+## Chat voice responses
+
+When Peter asks for a "voice" reply (e.g., "crazy scientist voice", "explain in voice"), generate audio and send it:
+
+```bash
+# Generate audio file
+sag -v Clawd -o /tmp/voice-reply.mp3 "Your message here"
+
+# Then include in reply:
+# MEDIA:/tmp/voice-reply.mp3
+```
+
+Voice character tips:
+- Crazy scientist: Use `[excited]` tags, dramatic pauses `[short pause]`, vary intensity
+- Calm: Use `[whispers]` or slower pacing
+- Dramatic: Use `[sings]` or `[shouts]` sparingly
+
+Default voice for Clawd: `lj2rcrvANS3gaWWnczSX` (or just `-v Clawd`)

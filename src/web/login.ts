@@ -1,30 +1,31 @@
-import fs from "node:fs/promises";
-
 import { DisconnectReason } from "@whiskeysockets/baileys";
-
+import { loadConfig } from "../config/config.js";
 import { danger, info, success } from "../globals.js";
 import { logInfo } from "../logger.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { resolveWhatsAppAccount } from "./accounts.js";
 import {
   createWaSocket,
   formatError,
-  resolveWebAuthDir,
+  logoutWeb,
   waitForWaConnection,
 } from "./session.js";
 
 export async function loginWeb(
   verbose: boolean,
-  provider = "whatsapp",
-  waitForConnection: typeof waitForWaConnection = waitForWaConnection,
+  waitForConnection?: typeof waitForWaConnection,
   runtime: RuntimeEnv = defaultRuntime,
+  accountId?: string,
 ) {
-  if (provider !== "whatsapp" && provider !== "web") {
-    throw new Error(`Unsupported provider: ${provider}`);
-  }
-  const sock = await createWaSocket(true, verbose);
+  const wait = waitForConnection ?? waitForWaConnection;
+  const cfg = loadConfig();
+  const account = resolveWhatsAppAccount({ cfg, accountId });
+  const sock = await createWaSocket(true, verbose, {
+    authDir: account.authDir,
+  });
   logInfo("Waiting for WhatsApp connection...", runtime);
   try {
-    await waitForConnection(sock);
+    await wait(sock);
     console.log(success("✅ Linked! Credentials saved for future sends."));
   } catch (err) {
     const code =
@@ -42,24 +43,26 @@ export async function loginWeb(
       } catch {
         // ignore
       }
-      const retry = await createWaSocket(false, verbose);
+      const retry = await createWaSocket(false, verbose, {
+        authDir: account.authDir,
+      });
       try {
-        await waitForConnection(retry);
-        console.log(
-          success(
-            "✅ Linked after restart; web session ready. You can now send with provider=web.",
-          ),
-        );
+        await wait(retry);
+        console.log(success("✅ Linked after restart; web session ready."));
         return;
       } finally {
         setTimeout(() => retry.ws?.close(), 500);
       }
     }
     if (code === DisconnectReason.loggedOut) {
-      await fs.rm(resolveWebAuthDir(), { recursive: true, force: true });
+      await logoutWeb({
+        authDir: account.authDir,
+        isLegacyAuthDir: account.isLegacyAuthDir,
+        runtime,
+      });
       console.error(
         danger(
-          "WhatsApp reported the session is logged out. Cleared cached web session; please rerun clawdis login and scan the QR again.",
+          "WhatsApp reported the session is logged out. Cleared cached web session; please rerun clawdbot providers login and scan the QR again.",
         ),
       );
       throw new Error("Session logged out; cache cleared. Re-run login.");

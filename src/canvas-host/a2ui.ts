@@ -5,9 +5,9 @@ import { fileURLToPath } from "node:url";
 
 import { detectMime } from "../media/mime.js";
 
-export const A2UI_PATH = "/__clawdis__/a2ui";
-export const CANVAS_HOST_PATH = "/__clawdis__/canvas";
-export const CANVAS_WS_PATH = "/__clawdis/ws";
+export const A2UI_PATH = "/__clawdbot__/a2ui";
+export const CANVAS_HOST_PATH = "/__clawdbot__/canvas";
+export const CANVAS_WS_PATH = "/__clawdbot/ws";
 
 let cachedA2uiRootReal: string | null | undefined;
 let resolvingA2uiRoot: Promise<string | null> | null = null;
@@ -15,7 +15,7 @@ let resolvingA2uiRoot: Promise<string | null> | null = null;
 async function resolveA2uiRoot(): Promise<string | null> {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
-    // Running from source (tsx) or dist (tsc + copied assets).
+    // Running from source (bun) or dist (tsc + copied assets).
     path.resolve(here, "a2ui"),
     // Running from dist without copied assets (fallback to source).
     path.resolve(here, "../../src/canvas-host/a2ui"),
@@ -98,9 +98,9 @@ export function injectCanvasLiveReload(html: string): string {
 (() => {
   // Cross-platform action bridge helper.
   // Works on:
-  // - iOS: window.webkit.messageHandlers.clawdisCanvasA2UIAction.postMessage(...)
-  // - Android: window.clawdisCanvasA2UIAction.postMessage(...)
-  const actionHandlerName = "clawdisCanvasA2UIAction";
+  // - iOS: window.webkit.messageHandlers.clawdbotCanvasA2UIAction.postMessage(...)
+  // - Android: window.clawdbotCanvasA2UIAction.postMessage(...)
+  const actionHandlerName = "clawdbotCanvasA2UIAction";
   function postToNode(payload) {
     try {
       const raw = typeof payload === "string" ? payload : JSON.stringify(payload);
@@ -125,11 +125,11 @@ export function injectCanvasLiveReload(html: string): string {
     const action = { ...userAction, id };
     return postToNode({ userAction: action });
   }
-  globalThis.Clawdis = globalThis.Clawdis ?? {};
-  globalThis.Clawdis.postMessage = postToNode;
-  globalThis.Clawdis.sendUserAction = sendUserAction;
-  globalThis.clawdisPostMessage = postToNode;
-  globalThis.clawdisSendUserAction = sendUserAction;
+  globalThis.Clawdbot = globalThis.Clawdbot ?? {};
+  globalThis.Clawdbot.postMessage = postToNode;
+  globalThis.Clawdbot.sendUserAction = sendUserAction;
+  globalThis.clawdbotPostMessage = postToNode;
+  globalThis.clawdbotSendUserAction = sendUserAction;
 
   try {
     const proto = location.protocol === "https:" ? "wss" : "ws";

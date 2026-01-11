@@ -1,8 +1,16 @@
 import net from "node:net";
-import { danger, info, isVerbose, logVerbose, warn } from "../globals.js";
+import { danger, info, shouldLogVerbose, warn } from "../globals.js";
 import { logDebug } from "../logger.js";
-import { runExec } from "../process/exec.js";
-import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import type { RuntimeEnv } from "../runtime.js";
+import { defaultRuntime } from "../runtime.js";
+import { formatPortDiagnostics } from "./ports-format.js";
+import { inspectPortUsage } from "./ports-inspect.js";
+import type {
+  PortListener,
+  PortListenerKind,
+  PortUsage,
+  PortUsageStatus,
+} from "./ports-types.js";
 
 class PortInUseError extends Error {
   port: number;
@@ -23,20 +31,9 @@ function isErrno(err: unknown): err is NodeJS.ErrnoException {
 export async function describePortOwner(
   port: number,
 ): Promise<string | undefined> {
-  // Best-effort process info for a listening port (macOS/Linux).
-  try {
-    const { stdout } = await runExec("lsof", [
-      "-i",
-      `tcp:${port}`,
-      "-sTCP:LISTEN",
-      "-nP",
-    ]);
-    const trimmed = stdout.trim();
-    if (trimmed) return trimmed;
-  } catch (err) {
-    logVerbose(`lsof unavailable: ${String(err)}`);
-  }
-  return undefined;
+  const diagnostics = await inspectPortUsage(port);
+  if (diagnostics.listeners.length === 0) return undefined;
+  return formatPortDiagnostics(diagnostics).join("\n");
 }
 
 export async function ensurePortAvailable(port: number): Promise<void> {
@@ -79,10 +76,10 @@ export async function handlePortError(
     if (details) {
       runtime.error(info("Port listener details:"));
       runtime.error(details);
-      if (/clawdis|src\/index\.ts|dist\/index\.js/.test(details)) {
+      if (/clawdbot|src\/index\.ts|dist\/index\.js/.test(details)) {
         runtime.error(
           warn(
-            "It looks like another clawdis instance is already running. Stop it or pick a different port.",
+            "It looks like another clawdbot instance is already running. Stop it or pick a different port.",
           ),
         );
       }
@@ -95,7 +92,7 @@ export async function handlePortError(
     runtime.exit(1);
   }
   runtime.error(danger(`${context} failed: ${String(err)}`));
-  if (isVerbose()) {
+  if (shouldLogVerbose()) {
     const stdout = (err as { stdout?: string })?.stdout;
     const stderr = (err as { stderr?: string })?.stderr;
     if (stdout?.trim()) logDebug(`stdout: ${stdout.trim()}`);
@@ -105,3 +102,10 @@ export async function handlePortError(
 }
 
 export { PortInUseError };
+export type { PortListener, PortListenerKind, PortUsage, PortUsageStatus };
+export {
+  buildPortHints,
+  classifyPortListener,
+  formatPortDiagnostics,
+} from "./ports-format.js";
+export { inspectPortUsage } from "./ports-inspect.js";

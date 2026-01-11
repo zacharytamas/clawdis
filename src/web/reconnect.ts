@@ -1,12 +1,10 @@
 import { randomUUID } from "node:crypto";
 
-import type { ClawdisConfig } from "../config/config.js";
+import type { ClawdbotConfig } from "../config/config.js";
+import type { BackoffPolicy } from "../infra/backoff.js";
+import { computeBackoff, sleepWithAbort } from "../infra/backoff.js";
 
-export type ReconnectPolicy = {
-  initialMs: number;
-  maxMs: number;
-  factor: number;
-  jitter: number;
+export type ReconnectPolicy = BackoffPolicy & {
   maxAttempts: number;
 };
 
@@ -23,7 +21,7 @@ const clamp = (val: number, min: number, max: number) =>
   Math.max(min, Math.min(max, val));
 
 export function resolveHeartbeatSeconds(
-  cfg: ClawdisConfig,
+  cfg: ClawdbotConfig,
   overrideSeconds?: number,
 ): number {
   const candidate = overrideSeconds ?? cfg.web?.heartbeatSeconds;
@@ -32,7 +30,7 @@ export function resolveHeartbeatSeconds(
 }
 
 export function resolveReconnectPolicy(
-  cfg: ClawdisConfig,
+  cfg: ClawdbotConfig,
   overrides?: Partial<ReconnectPolicy>,
 ): ReconnectPolicy {
   const reconnectOverrides = cfg.web?.reconnect ?? {};
@@ -51,35 +49,7 @@ export function resolveReconnectPolicy(
   return merged;
 }
 
-export function computeBackoff(policy: ReconnectPolicy, attempt: number) {
-  const base = policy.initialMs * policy.factor ** Math.max(attempt - 1, 0);
-  const jitter = base * policy.jitter * Math.random();
-  return Math.min(policy.maxMs, Math.round(base + jitter));
-}
-
-export function sleepWithAbort(ms: number, abortSignal?: AbortSignal) {
-  if (ms <= 0) return Promise.resolve();
-  return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      resolve();
-    }, ms);
-
-    const onAbort = () => {
-      cleanup();
-      reject(new Error("aborted"));
-    };
-
-    const cleanup = () => {
-      clearTimeout(timer);
-      abortSignal?.removeEventListener("abort", onAbort);
-    };
-
-    if (abortSignal) {
-      abortSignal.addEventListener("abort", onAbort, { once: true });
-    }
-  });
-}
+export { computeBackoff, sleepWithAbort };
 
 export function newConnectionId() {
   return randomUUID();

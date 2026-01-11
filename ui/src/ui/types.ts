@@ -1,7 +1,42 @@
 export type ProvidersStatusSnapshot = {
   ts: number;
-  whatsapp: WhatsAppStatus;
-  telegram: TelegramStatus;
+  providerOrder: string[];
+  providerLabels: Record<string, string>;
+  providers: Record<string, unknown>;
+  providerAccounts: Record<string, ProviderAccountSnapshot[]>;
+  providerDefaultAccountId: Record<string, string>;
+};
+
+export type ProviderAccountSnapshot = {
+  accountId: string;
+  name?: string | null;
+  enabled?: boolean | null;
+  configured?: boolean | null;
+  linked?: boolean | null;
+  running?: boolean | null;
+  connected?: boolean | null;
+  reconnectAttempts?: number | null;
+  lastConnectedAt?: number | null;
+  lastError?: string | null;
+  lastStartAt?: number | null;
+  lastStopAt?: number | null;
+  lastInboundAt?: number | null;
+  lastOutboundAt?: number | null;
+  lastProbeAt?: number | null;
+  mode?: string | null;
+  dmPolicy?: string | null;
+  allowFrom?: string[] | null;
+  tokenSource?: string | null;
+  botTokenSource?: string | null;
+  appTokenSource?: string | null;
+  baseUrl?: string | null;
+  allowUnmentionedGroups?: boolean | null;
+  cliPath?: string | null;
+  dbPath?: string | null;
+  port?: number | null;
+  probe?: unknown;
+  audit?: unknown;
+  application?: unknown;
 };
 
 export type WhatsAppSelf = {
@@ -62,6 +97,114 @@ export type TelegramStatus = {
   lastProbeAt?: number | null;
 };
 
+export type DiscordBot = {
+  id?: string | null;
+  username?: string | null;
+};
+
+export type DiscordProbe = {
+  ok: boolean;
+  status?: number | null;
+  error?: string | null;
+  elapsedMs?: number | null;
+  bot?: DiscordBot | null;
+};
+
+export type DiscordStatus = {
+  configured: boolean;
+  tokenSource?: string | null;
+  running: boolean;
+  lastStartAt?: number | null;
+  lastStopAt?: number | null;
+  lastError?: string | null;
+  probe?: DiscordProbe | null;
+  lastProbeAt?: number | null;
+};
+
+export type SlackBot = {
+  id?: string | null;
+  name?: string | null;
+};
+
+export type SlackTeam = {
+  id?: string | null;
+  name?: string | null;
+};
+
+export type SlackProbe = {
+  ok: boolean;
+  status?: number | null;
+  error?: string | null;
+  elapsedMs?: number | null;
+  bot?: SlackBot | null;
+  team?: SlackTeam | null;
+};
+
+export type SlackStatus = {
+  configured: boolean;
+  botTokenSource?: string | null;
+  appTokenSource?: string | null;
+  running: boolean;
+  lastStartAt?: number | null;
+  lastStopAt?: number | null;
+  lastError?: string | null;
+  probe?: SlackProbe | null;
+  lastProbeAt?: number | null;
+};
+
+export type SignalProbe = {
+  ok: boolean;
+  status?: number | null;
+  error?: string | null;
+  elapsedMs?: number | null;
+  version?: string | null;
+};
+
+export type SignalStatus = {
+  configured: boolean;
+  baseUrl: string;
+  running: boolean;
+  lastStartAt?: number | null;
+  lastStopAt?: number | null;
+  lastError?: string | null;
+  probe?: SignalProbe | null;
+  lastProbeAt?: number | null;
+};
+
+export type IMessageProbe = {
+  ok: boolean;
+  error?: string | null;
+};
+
+export type IMessageStatus = {
+  configured: boolean;
+  running: boolean;
+  lastStartAt?: number | null;
+  lastStopAt?: number | null;
+  lastError?: string | null;
+  cliPath?: string | null;
+  dbPath?: string | null;
+  probe?: IMessageProbe | null;
+  lastProbeAt?: number | null;
+};
+
+export type MSTeamsProbe = {
+  ok: boolean;
+  error?: string | null;
+  appId?: string | null;
+};
+
+export type MSTeamsStatus = {
+  configured: boolean;
+  running: boolean;
+  lastStartAt?: number | null;
+  lastStopAt?: number | null;
+  lastError?: string | null;
+  port?: number | null;
+  probe?: MSTeamsProbe | null;
+  lastProbeAt?: number | null;
+};
+
 export type ConfigSnapshotIssue = {
   path: string;
   message: string;
@@ -75,6 +218,26 @@ export type ConfigSnapshot = {
   valid?: boolean | null;
   config?: Record<string, unknown> | null;
   issues?: ConfigSnapshotIssue[] | null;
+};
+
+export type ConfigUiHint = {
+  label?: string;
+  help?: string;
+  group?: string;
+  order?: number;
+  advanced?: boolean;
+  sensitive?: boolean;
+  placeholder?: string;
+  itemTemplate?: unknown;
+};
+
+export type ConfigUiHints = Record<string, ConfigUiHint>;
+
+export type ConfigSchemaResponse = {
+  schema: unknown;
+  uiHints: ConfigUiHints;
+  version: string;
+  generatedAt: string;
 };
 
 export type PresenceEntry = {
@@ -100,12 +263,20 @@ export type GatewaySessionsDefaults = {
 export type GatewaySessionRow = {
   key: string;
   kind: "direct" | "group" | "global" | "unknown";
+  label?: string;
+  displayName?: string;
+  surface?: string;
+  subject?: string;
+  room?: string;
+  space?: string;
   updatedAt: number | null;
   sessionId?: string;
   systemSent?: boolean;
   abortedLastRun?: boolean;
   thinkingLevel?: string;
   verboseLevel?: string;
+  reasoningLevel?: string;
+  elevatedLevel?: string;
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
@@ -130,6 +301,8 @@ export type SessionsPatchResult = {
     updatedAt?: number;
     thinkingLevel?: string;
     verboseLevel?: string;
+    reasoningLevel?: string;
+    elevatedLevel?: string;
   };
 };
 
@@ -149,7 +322,15 @@ export type CronPayload =
       thinking?: string;
       timeoutSeconds?: number;
       deliver?: boolean;
-      channel?: "last" | "whatsapp" | "telegram";
+      provider?:
+        | "last"
+        | "whatsapp"
+        | "telegram"
+        | "discord"
+        | "slack"
+        | "signal"
+        | "imessage"
+        | "msteams";
       to?: string;
       bestEffortDeliver?: boolean;
     };
@@ -184,7 +365,7 @@ export type CronJob = {
 
 export type CronStatus = {
   enabled: boolean;
-  jobCount: number;
+  jobs: number;
   nextWakeAtMs?: number | null;
 };
 
@@ -222,16 +403,19 @@ export type SkillStatusEntry = {
   homepage?: string;
   always: boolean;
   disabled: boolean;
+  blockedByAllowlist: boolean;
   eligible: boolean;
   requirements: {
     bins: string[];
     env: string[];
     config: string[];
+    os: string[];
   };
   missing: {
     bins: string[];
     env: string[];
     config: string[];
+    os: string[];
   };
   configChecks: SkillsStatusConfigCheck[];
   install: SkillInstallOption[];
@@ -246,3 +430,20 @@ export type SkillStatusReport = {
 export type StatusSummary = Record<string, unknown>;
 
 export type HealthSnapshot = Record<string, unknown>;
+
+export type LogLevel =
+  | "trace"
+  | "debug"
+  | "info"
+  | "warn"
+  | "error"
+  | "fatal";
+
+export type LogEntry = {
+  raw: string;
+  time?: string | null;
+  level?: LogLevel | null;
+  subsystem?: string | null;
+  message?: string | null;
+  meta?: Record<string, unknown> | null;
+};

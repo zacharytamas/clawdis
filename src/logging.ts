@@ -4,16 +4,17 @@ import util from "node:util";
 
 import { Chalk } from "chalk";
 import { Logger as TsLogger } from "tslog";
-import { type ClawdisConfig, loadConfig } from "./config/config.js";
+import { type ClawdbotConfig, loadConfig } from "./config/config.js";
 import { isVerbose } from "./globals.js";
+import { CHAT_PROVIDER_ORDER } from "./providers/registry.js";
 import { defaultRuntime, type RuntimeEnv } from "./runtime.js";
 
 // Pin to /tmp so mac Debug UI and docs match; os.tmpdir() can be a per-user
 // randomized path on macOS which made the “Open log” button a no-op.
-export const DEFAULT_LOG_DIR = "/tmp/clawdis";
-export const DEFAULT_LOG_FILE = path.join(DEFAULT_LOG_DIR, "clawdis.log"); // legacy single-file path
+export const DEFAULT_LOG_DIR = "/tmp/clawdbot";
+export const DEFAULT_LOG_FILE = path.join(DEFAULT_LOG_DIR, "clawdbot.log"); // legacy single-file path
 
-const LOG_PREFIX = "clawdis";
+const LOG_PREFIX = "clawdbot";
 const LOG_SUFFIX = ".log";
 const MAX_LOG_AGE_MS = 24 * 60 * 60 * 1000; // 24h
 
@@ -57,6 +58,7 @@ let cachedConsoleSettings: ConsoleSettings | null = null;
 let overrideSettings: LoggerSettings | null = null;
 let consolePatched = false;
 let forceConsoleToStderr = false;
+let consoleSubsystemFilter: string[] | null = null;
 let rawConsole: {
   log: typeof console.log;
   info: typeof console.info;
@@ -65,7 +67,6 @@ let rawConsole: {
 } | null = null;
 
 function normalizeLevel(level?: string): Level {
-  if (isVerbose()) return "trace";
   const candidate = level ?? "info";
   return ALLOWED_LEVELS.includes(candidate as Level)
     ? (candidate as Level)
@@ -73,7 +74,7 @@ function normalizeLevel(level?: string): Level {
 }
 
 function resolveSettings(): ResolvedSettings {
-  const cfg: ClawdisConfig["logging"] | undefined =
+  const cfg: ClawdbotConfig["logging"] | undefined =
     overrideSettings ?? loadConfig().logging;
   const level = normalizeLevel(cfg?.level);
   const file = cfg?.file ?? defaultRollingPathForToday();
@@ -81,7 +82,7 @@ function resolveSettings(): ResolvedSettings {
 }
 
 function resolveConsoleSettings(): ConsoleSettings {
-  const cfg: ClawdisConfig["logging"] | undefined =
+  const cfg: ClawdbotConfig["logging"] | undefined =
     overrideSettings ?? loadConfig().logging;
   const level = normalizeConsoleLevel(cfg?.consoleLevel);
   const style = normalizeConsoleStyle(cfg?.consoleStyle);
@@ -112,6 +113,12 @@ function levelToMinLevel(level: Level): number {
   return map[level];
 }
 
+export function isFileLogLevelEnabled(level: LogLevel): boolean {
+  const settings = cachedSettings ?? resolveSettings();
+  if (!cachedSettings) cachedSettings = settings;
+  return levelToMinLevel(level) <= levelToMinLevel(settings.level);
+}
+
 function normalizeConsoleLevel(level?: string): Level {
   if (isVerbose()) return "debug";
   const candidate = level ?? "info";
@@ -135,7 +142,7 @@ function buildLogger(settings: ResolvedSettings): TsLogger<LogObj> {
     pruneOldRollingLogs(path.dirname(settings.file));
   }
   const logger = new TsLogger<LogObj>({
-    name: "clawdis",
+    name: "clawdbot",
     minLevel: levelToMinLevel(settings.level),
     type: "hidden", // no ansi formatting
   });
@@ -251,6 +258,26 @@ export function resetLogger() {
 // This keeps stdout clean for RPC/JSON modes.
 export function routeLogsToStderr(): void {
   forceConsoleToStderr = true;
+}
+
+export function setConsoleSubsystemFilter(filters?: string[] | null): void {
+  if (!filters || filters.length === 0) {
+    consoleSubsystemFilter = null;
+    return;
+  }
+  const normalized = filters
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  consoleSubsystemFilter = normalized.length > 0 ? normalized : null;
+}
+
+export function shouldLogSubsystemToConsole(subsystem: string): boolean {
+  if (!consoleSubsystemFilter || consoleSubsystemFilter.length === 0) {
+    return true;
+  }
+  return consoleSubsystemFilter.some(
+    (prefix) => subsystem === prefix || subsystem.startsWith(`${prefix}/`),
+  );
 }
 
 const SUPPRESSED_CONSOLE_PREFIXES = [
@@ -376,7 +403,11 @@ function isRichConsoleEnv(): boolean {
 }
 
 function getColorForConsole(): ChalkInstance {
-  if (process.env.NO_COLOR) return new Chalk({ level: 0 });
+  const hasForceColor =
+    typeof process.env.FORCE_COLOR === "string" &&
+    process.env.FORCE_COLOR.trim().length > 0 &&
+    process.env.FORCE_COLOR.trim() !== "0";
+  if (process.env.NO_COLOR && !hasForceColor) return new Chalk({ level: 0 });
   const hasTty = Boolean(process.stdout.isTTY || process.stderr.isTTY);
   return hasTty || isRichConsoleEnv()
     ? new Chalk({ level: 1 })
@@ -391,13 +422,22 @@ const SUBSYSTEM_COLORS = [
   "magenta",
   "red",
 ] as const;
+const SUBSYSTEM_COLOR_OVERRIDES: Record<
+  string,
+  (typeof SUBSYSTEM_COLORS)[number]
+> = {
+  "gmail-watcher": "blue",
+};
 const SUBSYSTEM_PREFIXES_TO_DROP = ["gateway", "providers"] as const;
 const SUBSYSTEM_MAX_SEGMENTS = 2;
+const PROVIDER_SUBSYSTEM_PREFIXES = new Set<string>(CHAT_PROVIDER_ORDER);
 
 function pickSubsystemColor(
   color: ChalkInstance,
   subsystem: string,
 ): ChalkInstance {
+  const override = SUBSYSTEM_COLOR_OVERRIDES[subsystem];
+  if (override) return color[override];
   let hash = 0;
   for (let i = 0; i < subsystem.length; i += 1) {
     hash = (hash * 31 + subsystem.charCodeAt(i)) | 0;
@@ -419,7 +459,7 @@ function formatSubsystemForConsole(subsystem: string): string {
     parts.shift();
   }
   if (parts.length === 0) return original;
-  if (parts[0] === "whatsapp" || parts[0] === "telegram") {
+  if (PROVIDER_SUBSYSTEM_PREFIXES.has(parts[0])) {
     return parts[0];
   }
   if (parts.length > SUBSYSTEM_MAX_SEGMENTS) {
@@ -469,13 +509,19 @@ function formatConsoleLine(opts: {
 }
 
 function writeConsoleLine(level: Level, line: string) {
+  const sanitized =
+    process.platform === "win32" && process.env.GITHUB_ACTIONS === "true"
+      ? line
+          .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, "?")
+          .replace(/[\uD800-\uDFFF]/g, "?")
+      : line;
   const sink = rawConsole ?? console;
   if (forceConsoleToStderr || level === "error" || level === "fatal") {
-    (sink.error ?? console.error)(line);
+    (sink.error ?? console.error)(sanitized);
   } else if (level === "warn") {
-    (sink.warn ?? console.warn)(line);
+    (sink.warn ?? console.warn)(sanitized);
   } else {
-    (sink.log ?? console.log)(line);
+    (sink.log ?? console.log)(sanitized);
   }
 }
 
@@ -523,6 +569,7 @@ export function createSubsystemLogger(subsystem: string): SubsystemLogger {
     }
     logToFile(getFileLogger(), level, message, fileMeta);
     if (!shouldLogToConsole(level, consoleSettings)) return;
+    if (!shouldLogSubsystemToConsole(subsystem)) return;
     const line = formatConsoleLine({
       level,
       subsystem,
@@ -546,7 +593,9 @@ export function createSubsystemLogger(subsystem: string): SubsystemLogger {
     fatal: (message, meta) => emit("fatal", message, meta),
     raw: (message) => {
       logToFile(getFileLogger(), "info", message, { raw: true });
-      writeConsoleLine("info", message);
+      if (shouldLogSubsystemToConsole(subsystem)) {
+        writeConsoleLine("info", message);
+      }
     },
     child: (name) => createSubsystemLogger(`${subsystem}/${name}`),
   };

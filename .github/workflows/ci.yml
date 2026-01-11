@@ -5,12 +5,8 @@ on:
   pull_request:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime: [node, bun]
+  install-check:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,32 +27,97 @@ jobs:
           exit 1
 
       - name: Setup Node.js
-        if: matrix.runtime == 'node'
         uses: actions/setup-node@v4
         with:
-          node-version: 24
-          check-latest: true
-
-      - name: Setup Bun
-        if: matrix.runtime == 'bun'
-        uses: oven-sh/setup-bun@v2
-        with:
-          # bun.sh downloads currently fail with:
-          # "Failed to list releases from GitHub: 401" -> "Unexpected HTTP response: 400"
-          bun-download-url: "https://github.com/oven-sh/bun/releases/latest/download/bun-linux-x64.zip"
-
-      - name: Setup Node.js (tooling for bun)
-        if: matrix.runtime == 'bun'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
+          node-version: 22.x
           check-latest: true
 
       - name: Runtime versions
         run: |
           node -v
           npm -v
-          if [ "${{ matrix.runtime }}" = "bun" ]; then bun -v; fi
+
+      - name: Capture node path
+        run: echo "NODE_BIN=$(dirname \"$(node -p \"process.execPath\")\")" >> "$GITHUB_ENV"
+
+      - name: Enable corepack and pin pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.23.0 --activate
+          pnpm -v
+
+      - name: Install dependencies (frozen)
+        env:
+          CI: true
+        run: |
+          export PATH="$NODE_BIN:$PATH"
+          which node
+          node -v
+          pnpm -v
+          pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
+
+  checks:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: node
+            task: lint
+            command: pnpm lint
+          - runtime: node
+            task: test
+            command: pnpm test
+          - runtime: node
+            task: build
+            command: pnpm build
+          - runtime: node
+            task: protocol
+            command: pnpm protocol:check
+          - runtime: bun
+            task: lint
+            command: bunx biome check src
+          - runtime: bun
+            task: test
+            command: bunx vitest run
+          - runtime: bun
+            task: build
+            command: bunx tsc -p tsconfig.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules (retry)
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          for attempt in 1 2 3 4 5; do
+            if git -c protocol.version=2 submodule update --init --force --depth=1 --recursive; then
+              exit 0
+            fi
+            echo "Submodule update failed (attempt $attempt/5). Retrying…"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          check-latest: true
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Runtime versions
+        run: |
+          node -v
+          npm -v
+          bun -v
 
       - name: Capture node path
         run: echo "NODE_BIN=$(dirname \"$(node -p \"process.execPath\")\")" >> "$GITHUB_ENV"
@@ -75,39 +136,184 @@ jobs:
           which node
           node -v
           pnpm -v
-          pnpm install --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true || pnpm install --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
+          pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true || pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
 
-      - name: Lint (node)
-        if: matrix.runtime == 'node'
-        run: pnpm lint
+      - name: Run ${{ matrix.task }} (${{ matrix.runtime }})
+        run: ${{ matrix.command }}
 
-      - name: Test (node)
-        if: matrix.runtime == 'node'
-        run: pnpm test
+  checks-windows:
+    runs-on: blacksmith-4vcpu-windows-2025
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: node
+            task: lint
+            command: pnpm lint
+          - runtime: node
+            task: test
+            command: pnpm test
+          - runtime: node
+            task: build
+            command: pnpm build
+          - runtime: node
+            task: protocol
+            command: pnpm protocol:check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
 
-      - name: Build (node)
-        if: matrix.runtime == 'node'
-        run: pnpm build
+      - name: Checkout submodules (retry)
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          for attempt in 1 2 3 4 5; do
+            if git -c protocol.version=2 submodule update --init --force --depth=1 --recursive; then
+              exit 0
+            fi
+            echo "Submodule update failed (attempt $attempt/5). Retrying…"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
-      - name: Protocol check (node)
-        if: matrix.runtime == 'node'
-        run: pnpm protocol:check
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          check-latest: true
 
-      - name: Lint (bun)
-        if: matrix.runtime == 'bun'
-        run: bunx biome check src
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
-      - name: Test (bun)
-        if: matrix.runtime == 'bun'
-        run: bunx vitest run
+      - name: Runtime versions
+        run: |
+          node -v
+          npm -v
+          bun -v
 
-      - name: Build (bun)
-        if: matrix.runtime == 'bun'
-        run: bunx tsc -p tsconfig.json
+      - name: Capture node path
+        run: echo "NODE_BIN=$(dirname \"$(node -p \"process.execPath\")\")" >> "$GITHUB_ENV"
+
+      - name: Enable corepack and pin pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.23.0 --activate
+          pnpm -v
+
+      - name: Install dependencies
+        env:
+          CI: true
+        run: |
+          export PATH="$NODE_BIN:$PATH"
+          which node
+          node -v
+          pnpm -v
+          pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true || pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
+
+      - name: Run ${{ matrix.task }} (${{ matrix.runtime }})
+        run: ${{ matrix.command }}
+
+  checks-macos:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - task: test
+            command: pnpm test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules (retry)
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          for attempt in 1 2 3 4 5; do
+            if git -c protocol.version=2 submodule update --init --force --depth=1 --recursive; then
+              exit 0
+            fi
+            echo "Submodule update failed (attempt $attempt/5). Retrying…"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          check-latest: true
+
+      - name: Runtime versions
+        run: |
+          node -v
+          npm -v
+
+      - name: Capture node path
+        run: echo "NODE_BIN=$(dirname \"$(node -p \"process.execPath\")\")" >> "$GITHUB_ENV"
+
+      - name: Enable corepack and pin pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.23.0 --activate
+          pnpm -v
+
+      - name: Install dependencies
+        env:
+          CI: true
+        run: |
+          export PATH="$NODE_BIN:$PATH"
+          which node
+          node -v
+          pnpm -v
+          pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true || pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
+
+      - name: Run ${{ matrix.task }}
+        run: ${{ matrix.command }}
 
   macos-app:
     if: github.event_name == 'pull_request'
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - task: lint
+            command: |
+              swiftlint --config .swiftlint.yml
+              swiftformat --lint apps/macos/Sources --config .swiftformat
+          - task: build
+            command: |
+              set -euo pipefail
+              for attempt in 1 2 3; do
+                if swift build --package-path apps/macos --configuration release; then
+                  exit 0
+                fi
+                echo "swift build failed (attempt $attempt/3). Retrying…"
+                sleep $((attempt * 20))
+              done
+              exit 1
+          - task: test
+            command: |
+              set -euo pipefail
+              for attempt in 1 2 3; do
+                if swift test --package-path apps/macos --parallel --enable-code-coverage --show-codecov-path; then
+                  exit 0
+                fi
+                echo "swift test failed (attempt $attempt/3). Retrying…"
+                sleep $((attempt * 20))
+              done
+              exit 1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -142,35 +348,8 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - name: SwiftLint
-        run: swiftlint --config .swiftlint.yml
-
-      - name: SwiftFormat (lint mode)
-        run: swiftformat --lint apps/macos/Sources --config .swiftformat
-
-      - name: Swift build (release)
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if swift build --package-path apps/macos --configuration release; then
-              exit 0
-            fi
-            echo "swift build failed (attempt $attempt/3). Retrying…"
-            sleep $((attempt * 20))
-          done
-          exit 1
-
-      - name: Swift tests (coverage)
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if swift test --package-path apps/macos --parallel --enable-code-coverage --show-codecov-path; then
-              exit 0
-            fi
-            echo "swift test failed (attempt $attempt/3). Retrying…"
-            sleep $((attempt * 20))
-          done
-          exit 1
+      - name: Run ${{ matrix.task }}
+        run: ${{ matrix.command }}
   ios:
     if: false # ignore iOS in CI for now
     runs-on: macos-latest
@@ -345,7 +524,15 @@ jobs:
           PY
 
   android:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - task: test
+            command: ./gradlew --no-daemon :app:testDebugUnitTest
+          - task: build
+            command: ./gradlew --no-daemon :app:assembleDebug
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -373,6 +560,8 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -385,6 +574,6 @@ jobs:
             "platforms;android-36" \
             "build-tools;36.0.0"
 
-      - name: Android unit tests + debug build
+      - name: Run Android ${{ matrix.task }}
         working-directory: apps/android
-        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug
+        run: ${{ matrix.command }}

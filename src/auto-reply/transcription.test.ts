@@ -4,15 +4,14 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { transcribeInboundAudio } from "./transcription.js";
-
 vi.mock("../globals.js", () => ({
   isVerbose: () => false,
   logVerbose: vi.fn(),
+  shouldLogVerbose: () => false,
 }));
 
 vi.mock("../process/exec.js", () => ({
-  runExec: vi.fn(async () => ({ stdout: "transcribed text\n" })),
+  runExec: vi.fn(),
 }));
 
 const runtime = {
@@ -22,11 +21,12 @@ const runtime = {
 describe("transcribeInboundAudio", () => {
   afterEach(() => {
     vi.resetAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("downloads mediaUrl to temp file and returns transcript", async () => {
     const tmpBuf = Buffer.from("audio-bytes");
-    const tmpFile = path.join(os.tmpdir(), `clawdis-audio-${Date.now()}.ogg`);
+    const tmpFile = path.join(os.tmpdir(), `clawdbot-audio-${Date.now()}.ogg`);
     await fs.writeFile(tmpFile, tmpBuf);
 
     const fetchMock = vi.fn(async () => ({
@@ -34,19 +34,26 @@ describe("transcribeInboundAudio", () => {
       status: 200,
       arrayBuffer: async () => tmpBuf,
     })) as unknown as typeof fetch;
-    // @ts-expect-error override global fetch for test
-    global.fetch = fetchMock;
+    vi.stubGlobal("fetch", fetchMock);
 
     const cfg = {
-      routing: {
-        transcribeAudio: {
-          command: ["echo", "{{MediaPath}}"],
-          timeoutSeconds: 5,
+      tools: {
+        audio: {
+          transcription: {
+            args: ["echo", "{{MediaPath}}"],
+            timeoutSeconds: 5,
+          },
         },
       },
     };
     const ctx = { MediaUrl: "https://example.com/audio.ogg" };
 
+    const execModule = await import("../process/exec.js");
+    vi.mocked(execModule.runExec).mockResolvedValue({
+      stdout: "transcribed text\n",
+      stderr: "",
+    });
+    const { transcribeInboundAudio } = await import("./transcription.js");
     const result = await transcribeInboundAudio(
       cfg as never,
       ctx as never,
@@ -57,8 +64,9 @@ describe("transcribeInboundAudio", () => {
   });
 
   it("returns undefined when no transcription command", async () => {
+    const { transcribeInboundAudio } = await import("./transcription.js");
     const res = await transcribeInboundAudio(
-      { routing: {} } as never,
+      { audio: {} } as never,
       {} as never,
       runtime as never,
     );

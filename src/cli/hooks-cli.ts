@@ -30,7 +30,7 @@ export function registerHooksCli(program: Command) {
 
   gmail
     .command("setup")
-    .description("Configure Gmail watch + Pub/Sub + Clawdis hooks")
+    .description("Configure Gmail watch + Pub/Sub + Clawdbot hooks")
     .requiredOption("--account <email>", "Gmail account to watch")
     .option("--project <id>", "GCP project id (OAuth client owner)")
     .option("--topic <name>", "Pub/Sub topic name", DEFAULT_GMAIL_TOPIC)
@@ -40,8 +40,8 @@ export function registerHooksCli(program: Command) {
       DEFAULT_GMAIL_SUBSCRIPTION,
     )
     .option("--label <label>", "Gmail label to watch", DEFAULT_GMAIL_LABEL)
-    .option("--hook-url <url>", "Clawdis hook URL")
-    .option("--hook-token <token>", "Clawdis hook token")
+    .option("--hook-url <url>", "Clawdbot hook URL")
+    .option("--hook-token <token>", "Clawdbot hook token")
     .option("--push-token <token>", "Push token for gog watch serve")
     .option(
       "--bind <host>",
@@ -71,6 +71,10 @@ export function registerHooksCli(program: Command) {
       "funnel",
     )
     .option("--tailscale-path <path>", "Path for tailscale serve/funnel")
+    .option(
+      "--tailscale-target <target>",
+      "Tailscale serve/funnel target (port, host:port, or URL)",
+    )
     .option("--push-endpoint <url>", "Explicit Pub/Sub push endpoint")
     .option("--json", "Output JSON summary", false)
     .action(async (opts) => {
@@ -90,8 +94,8 @@ export function registerHooksCli(program: Command) {
     .option("--topic <topic>", "Pub/Sub topic path (projects/.../topics/..)")
     .option("--subscription <name>", "Pub/Sub subscription name")
     .option("--label <label>", "Gmail label to watch")
-    .option("--hook-url <url>", "Clawdis hook URL")
-    .option("--hook-token <token>", "Clawdis hook token")
+    .option("--hook-url <url>", "Clawdbot hook URL")
+    .option("--hook-token <token>", "Clawdbot hook token")
     .option("--push-token <token>", "Push token for gog watch serve")
     .option("--bind <host>", "gog watch serve bind host")
     .option("--port <port>", "gog watch serve port")
@@ -104,6 +108,10 @@ export function registerHooksCli(program: Command) {
       "Expose push endpoint via tailscale (funnel|serve|off)",
     )
     .option("--tailscale-path <path>", "Path for tailscale serve/funnel")
+    .option(
+      "--tailscale-target <target>",
+      "Tailscale serve/funnel target (port, host:port, or URL)",
+    )
     .action(async (opts) => {
       try {
         const parsed = parseGmailRunOptions(opts);
@@ -138,6 +146,7 @@ function parseGmailSetupOptions(
     renewEveryMinutes: numberOption(raw.renewMinutes),
     tailscale: stringOption(raw.tailscale) as GmailSetupOptions["tailscale"],
     tailscalePath: stringOption(raw.tailscalePath),
+    tailscaleTarget: stringOption(raw.tailscaleTarget),
     pushEndpoint: stringOption(raw.pushEndpoint),
     json: Boolean(raw.json),
   };
@@ -160,6 +169,7 @@ function parseGmailRunOptions(raw: Record<string, unknown>): GmailRunOptions {
     renewEveryMinutes: numberOption(raw.renewMinutes),
     tailscale: stringOption(raw.tailscale) as GmailRunOptions["tailscale"],
     tailscalePath: stringOption(raw.tailscalePath),
+    tailscaleTarget: stringOption(raw.tailscaleTarget),
   };
 }
 

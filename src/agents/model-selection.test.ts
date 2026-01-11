@@ -1,75 +1,205 @@
 import { describe, expect, it } from "vitest";
 
-import type { ClawdisConfig } from "../config/config.js";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
-import { resolveConfiguredModelRef } from "./model-selection.js";
+import type { ClawdbotConfig } from "../config/config.js";
+import { DEFAULT_PROVIDER } from "./defaults.js";
+import {
+  buildAllowedModelSet,
+  modelKey,
+  parseModelRef,
+  resolveAllowedModelRef,
+  resolveHooksGmailModel,
+} from "./model-selection.js";
 
-describe("resolveConfiguredModelRef", () => {
-  it("parses provider/model from agent.model", () => {
+const catalog = [
+  {
+    provider: "openai",
+    id: "gpt-4",
+    name: "GPT-4",
+  },
+];
+
+describe("buildAllowedModelSet", () => {
+  it("always allows the configured default model", () => {
     const cfg = {
-      agent: { model: "openai/gpt-4.1-mini" },
-    } satisfies ClawdisConfig;
-
-    const resolved = resolveConfiguredModelRef({
-      cfg,
-      defaultProvider: DEFAULT_PROVIDER,
-      defaultModel: DEFAULT_MODEL,
-    });
-
-    expect(resolved).toEqual({ provider: "openai", model: "gpt-4.1-mini" });
-  });
-
-  it("falls back to anthropic when agent.model omits provider", () => {
-    const cfg = {
-      agent: { model: "claude-opus-4-5" },
-    } satisfies ClawdisConfig;
-
-    const resolved = resolveConfiguredModelRef({
-      cfg,
-      defaultProvider: DEFAULT_PROVIDER,
-      defaultModel: DEFAULT_MODEL,
-    });
-
-    expect(resolved).toEqual({
-      provider: "anthropic",
-      model: "claude-opus-4-5",
-    });
-  });
-
-  it("falls back to defaults when agent.model is missing", () => {
-    const cfg = {} satisfies ClawdisConfig;
-
-    const resolved = resolveConfiguredModelRef({
-      cfg,
-      defaultProvider: DEFAULT_PROVIDER,
-      defaultModel: DEFAULT_MODEL,
-    });
-
-    expect(resolved).toEqual({
-      provider: DEFAULT_PROVIDER,
-      model: DEFAULT_MODEL,
-    });
-  });
-
-  it("resolves agent.model aliases when configured", () => {
-    const cfg = {
-      agent: {
-        model: "Opus",
-        modelAliases: {
-          Opus: "anthropic/claude-opus-4-5",
+      agents: {
+        defaults: {
+          models: {
+            "openai/gpt-4": { alias: "gpt4" },
+          },
         },
       },
-    } satisfies ClawdisConfig;
+    } as ClawdbotConfig;
 
-    const resolved = resolveConfiguredModelRef({
+    const allowed = buildAllowedModelSet({
       cfg,
-      defaultProvider: DEFAULT_PROVIDER,
-      defaultModel: DEFAULT_MODEL,
+      catalog,
+      defaultProvider: "claude-cli",
+      defaultModel: "opus-4.5",
     });
 
-    expect(resolved).toEqual({
+    expect(allowed.allowAny).toBe(false);
+    expect(allowed.allowedKeys.has(modelKey("openai", "gpt-4"))).toBe(true);
+    expect(allowed.allowedKeys.has(modelKey("claude-cli", "opus-4.5"))).toBe(
+      true,
+    );
+  });
+
+  it("includes the default model when no allowlist is set", () => {
+    const cfg = {
+      agents: { defaults: {} },
+    } as ClawdbotConfig;
+
+    const allowed = buildAllowedModelSet({
+      cfg,
+      catalog,
+      defaultProvider: "claude-cli",
+      defaultModel: "opus-4.5",
+    });
+
+    expect(allowed.allowAny).toBe(true);
+    expect(allowed.allowedKeys.has(modelKey("openai", "gpt-4"))).toBe(true);
+    expect(allowed.allowedKeys.has(modelKey("claude-cli", "opus-4.5"))).toBe(
+      true,
+    );
+  });
+});
+
+describe("parseModelRef", () => {
+  it("normalizes anthropic/opus-4.5 to claude-opus-4-5", () => {
+    const ref = parseModelRef("anthropic/opus-4.5", "anthropic");
+    expect(ref).toEqual({
       provider: "anthropic",
       model: "claude-opus-4-5",
+    });
+  });
+});
+
+describe("resolveHooksGmailModel", () => {
+  it("returns null when hooks.gmail.model is not set", () => {
+    const cfg = {} satisfies ClawdbotConfig;
+    const result = resolveHooksGmailModel({
+      cfg,
+      defaultProvider: DEFAULT_PROVIDER,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("returns null when hooks.gmail.model is empty", () => {
+    const cfg = {
+      hooks: { gmail: { model: "" } },
+    } satisfies ClawdbotConfig;
+    const result = resolveHooksGmailModel({
+      cfg,
+      defaultProvider: DEFAULT_PROVIDER,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("parses provider/model from hooks.gmail.model", () => {
+    const cfg = {
+      hooks: { gmail: { model: "openrouter/meta-llama/llama-3.3-70b:free" } },
+    } satisfies ClawdbotConfig;
+    const result = resolveHooksGmailModel({
+      cfg,
+      defaultProvider: DEFAULT_PROVIDER,
+    });
+    expect(result).toEqual({
+      provider: "openrouter",
+      model: "meta-llama/llama-3.3-70b:free",
+    });
+  });
+
+  it("resolves alias from agent.models", () => {
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "anthropic/claude-sonnet-4-1": { alias: "Sonnet" },
+          },
+        },
+      },
+      hooks: { gmail: { model: "Sonnet" } },
+    } satisfies ClawdbotConfig;
+    const result = resolveHooksGmailModel({
+      cfg,
+      defaultProvider: DEFAULT_PROVIDER,
+    });
+    expect(result).toEqual({
+      provider: "anthropic",
+      model: "claude-sonnet-4-1",
+    });
+  });
+
+  it("uses default provider when model omits provider", () => {
+    const cfg = {
+      hooks: { gmail: { model: "claude-haiku-3-5" } },
+    } satisfies ClawdbotConfig;
+    const result = resolveHooksGmailModel({
+      cfg,
+      defaultProvider: "anthropic",
+    });
+    expect(result).toEqual({
+      provider: "anthropic",
+      model: "claude-haiku-3-5",
+    });
+  });
+});
+
+describe("resolveAllowedModelRef", () => {
+  it("resolves aliases when allowed", () => {
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "anthropic/claude-sonnet-4-1": { alias: "Sonnet" },
+          },
+        },
+      },
+    } satisfies ClawdbotConfig;
+    const resolved = resolveAllowedModelRef({
+      cfg,
+      catalog: [
+        {
+          provider: "anthropic",
+          id: "claude-sonnet-4-1",
+          name: "Sonnet",
+        },
+      ],
+      raw: "Sonnet",
+      defaultProvider: "anthropic",
+      defaultModel: "claude-opus-4-5",
+    });
+    expect("error" in resolved).toBe(false);
+    if ("ref" in resolved) {
+      expect(resolved.ref).toEqual({
+        provider: "anthropic",
+        model: "claude-sonnet-4-1",
+      });
+    }
+  });
+
+  it("rejects disallowed models", () => {
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "openai/gpt-4": { alias: "GPT4" },
+          },
+        },
+      },
+    } satisfies ClawdbotConfig;
+    const resolved = resolveAllowedModelRef({
+      cfg,
+      catalog: [
+        { provider: "openai", id: "gpt-4", name: "GPT-4" },
+        { provider: "anthropic", id: "claude-sonnet-4-1", name: "Sonnet" },
+      ],
+      raw: "anthropic/claude-sonnet-4-1",
+      defaultProvider: "openai",
+      defaultModel: "gpt-4",
+    });
+    expect(resolved).toEqual({
+      error: "model not allowed: anthropic/claude-sonnet-4-1",
     });
   });
 });

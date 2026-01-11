@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import process from "node:process";
 
-declare const __CLAWDIS_VERSION__: string;
+declare const __CLAWDBOT_VERSION__: string;
 
 const BUNDLED_VERSION =
-  typeof __CLAWDIS_VERSION__ === "string" ? __CLAWDIS_VERSION__ : "0.0.0";
+  (typeof __CLAWDBOT_VERSION__ === "string" && __CLAWDBOT_VERSION__) ||
+  process.env.CLAWDBOT_BUNDLED_VERSION ||
+  "0.0.0";
 
 function argValue(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -23,7 +25,7 @@ type GatewayWsLogStyle = "auto" | "full" | "compact";
 
 async function main() {
   if (hasFlag(args, "--version") || hasFlag(args, "-v")) {
-    // Match `clawdis --version` behavior for Swift env/version checks.
+    // Match `clawdbot --version` behavior for Swift env/version checks.
     // Keep output a single line.
     console.log(BUNDLED_VERSION);
     process.exit(0);
@@ -61,18 +63,21 @@ async function main() {
     wsLogRaw === "compact" ? "compact" : wsLogRaw === "full" ? "full" : "auto";
   setGatewayWsLogStyle(wsLogStyle);
 
+  const cfg = loadConfig();
   const portRaw =
-    argValue(args, "--port") ?? process.env.CLAWDIS_GATEWAY_PORT ?? "18789";
+    argValue(args, "--port") ??
+    process.env.CLAWDBOT_GATEWAY_PORT ??
+    (typeof cfg.gateway?.port === "number" ? String(cfg.gateway.port) : "") ??
+    "18789";
   const port = Number.parseInt(portRaw, 10);
   if (Number.isNaN(port) || port <= 0) {
     defaultRuntime.error(`Invalid --port (${portRaw})`);
     process.exit(1);
   }
 
-  const cfg = loadConfig();
   const bindRaw =
     argValue(args, "--bind") ??
-    process.env.CLAWDIS_GATEWAY_BIND ??
+    process.env.CLAWDBOT_GATEWAY_BIND ??
     cfg.gateway?.bind ??
     "loopback";
   const bind =
@@ -90,7 +95,7 @@ async function main() {
   }
 
   const token = argValue(args, "--token");
-  if (token) process.env.CLAWDIS_GATEWAY_TOKEN = token;
+  if (token) process.env.CLAWDBOT_GATEWAY_TOKEN = token;
 
   let server: Awaited<ReturnType<typeof startGatewayServer>> | null = null;
   let shuttingDown = false;
@@ -146,9 +151,18 @@ async function main() {
     })();
   };
 
-  const onSigterm = () => request("stop", "SIGTERM");
-  const onSigint = () => request("stop", "SIGINT");
-  const onSigusr1 = () => request("restart", "SIGUSR1");
+  const onSigterm = () => {
+    defaultRuntime.log("gateway: signal SIGTERM received");
+    request("stop", "SIGTERM");
+  };
+  const onSigint = () => {
+    defaultRuntime.log("gateway: signal SIGINT received");
+    request("stop", "SIGINT");
+  };
+  const onSigusr1 = () => {
+    defaultRuntime.log("gateway: signal SIGUSR1 received");
+    request("restart", "SIGUSR1");
+  };
 
   process.on("SIGTERM", onSigterm);
   process.on("SIGINT", onSigint);

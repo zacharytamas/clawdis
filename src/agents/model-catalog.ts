@@ -1,12 +1,13 @@
-import { type ClawdisConfig, loadConfig } from "../config/config.js";
-import { resolveClawdisAgentDir } from "./agent-paths.js";
-import { ensureClawdisModelsJson } from "./models-config.js";
+import { type ClawdbotConfig, loadConfig } from "../config/config.js";
+import { resolveClawdbotAgentDir } from "./agent-paths.js";
+import { ensureClawdbotModelsJson } from "./models-config.js";
 
 export type ModelCatalogEntry = {
   id: string;
   name: string;
   provider: string;
   contextWindow?: number;
+  reasoning?: boolean;
 };
 
 type DiscoveredModel = {
@@ -14,6 +15,7 @@ type DiscoveredModel = {
   name?: string;
   provider: string;
   contextWindow?: number;
+  reasoning?: boolean;
 };
 
 let modelCatalogPromise: Promise<ModelCatalogEntry[]> | null = null;
@@ -23,7 +25,7 @@ export function resetModelCatalogCacheForTest() {
 }
 
 export async function loadModelCatalog(params?: {
-  config?: ClawdisConfig;
+  config?: ClawdbotConfig;
   useCache?: boolean;
 }): Promise<ModelCatalogEntry[]> {
   if (params?.useCache === false) {
@@ -37,8 +39,8 @@ export async function loadModelCatalog(params?: {
     const models: ModelCatalogEntry[] = [];
     try {
       const cfg = params?.config ?? loadConfig();
-      await ensureClawdisModelsJson(cfg);
-      const agentDir = resolveClawdisAgentDir();
+      await ensureClawdbotModelsJson(cfg);
+      const agentDir = resolveClawdbotAgentDir();
       const authStorage = piSdk.discoverAuthStorage(agentDir);
       const registry = piSdk.discoverModels(authStorage, agentDir) as
         | {
@@ -56,10 +58,18 @@ export async function loadModelCatalog(params?: {
           typeof entry?.contextWindow === "number" && entry.contextWindow > 0
             ? entry.contextWindow
             : undefined;
-        models.push({ id, name, provider, contextWindow });
+        const reasoning =
+          typeof entry?.reasoning === "boolean" ? entry.reasoning : undefined;
+        models.push({ id, name, provider, contextWindow, reasoning });
+      }
+
+      if (models.length === 0) {
+        // If we found nothing, don't cache this result so we can try again.
+        modelCatalogPromise = null;
       }
     } catch {
-      // Leave models empty on discovery errors.
+      // Leave models empty on discovery errors and don't cache.
+      modelCatalogPromise = null;
     }
 
     return models.sort((a, b) => {

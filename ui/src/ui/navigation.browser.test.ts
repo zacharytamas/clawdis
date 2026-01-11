@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ClawdisApp } from "./app";
+import { ClawdbotApp } from "./app";
 
-const originalConnect = ClawdisApp.prototype.connect;
+const originalConnect = ClawdbotApp.prototype.connect;
 
 function mountApp(pathname: string) {
   window.history.replaceState({}, "", pathname);
-  const app = document.createElement("clawdis-app") as ClawdisApp;
+  const app = document.createElement("clawdbot-app") as ClawdbotApp;
   document.body.append(app);
   return app;
 }
@@ -18,14 +18,18 @@ function nextFrame() {
 }
 
 beforeEach(() => {
-  ClawdisApp.prototype.connect = () => {
+  ClawdbotApp.prototype.connect = () => {
     // no-op: avoid real gateway WS connections in browser tests
   };
+  window.__CLAWDBOT_CONTROL_UI_BASE_PATH__ = undefined;
+  localStorage.clear();
   document.body.innerHTML = "";
 });
 
 afterEach(() => {
-  ClawdisApp.prototype.connect = originalConnect;
+  ClawdbotApp.prototype.connect = originalConnect;
+  window.__CLAWDBOT_CONTROL_UI_BASE_PATH__ = undefined;
+  localStorage.clear();
   document.body.innerHTML = "";
 });
 
@@ -45,6 +49,25 @@ describe("control UI routing", () => {
     expect(app.basePath).toBe("/ui");
     expect(app.tab).toBe("cron");
     expect(window.location.pathname).toBe("/ui/cron");
+  });
+
+  it("infers nested base paths", async () => {
+    const app = mountApp("/apps/clawdbot/cron");
+    await app.updateComplete;
+
+    expect(app.basePath).toBe("/apps/clawdbot");
+    expect(app.tab).toBe("cron");
+    expect(window.location.pathname).toBe("/apps/clawdbot/cron");
+  });
+
+  it("honors explicit base path overrides", async () => {
+    window.__CLAWDBOT_CONTROL_UI_BASE_PATH__ = "/clawdbot";
+    const app = mountApp("/clawdbot/sessions");
+    await app.updateComplete;
+
+    expect(app.basePath).toBe("/clawdbot");
+    expect(app.tab).toBe("sessions");
+    expect(window.location.pathname).toBe("/clawdbot/sessions");
   });
 
   it("updates the URL when clicking nav items", async () => {
@@ -81,13 +104,50 @@ describe("control UI routing", () => {
     }));
 
     await app.updateComplete;
-    await nextFrame();
+    for (let i = 0; i < 6; i++) {
+      await nextFrame();
+    }
 
     const container = app.querySelector(".chat-thread") as HTMLElement | null;
     expect(container).not.toBeNull();
     if (!container) return;
     const maxScroll = container.scrollHeight - container.clientHeight;
     expect(maxScroll).toBeGreaterThan(0);
+    for (let i = 0; i < 10; i++) {
+      if (container.scrollTop === maxScroll) break;
+      await nextFrame();
+    }
     expect(container.scrollTop).toBe(maxScroll);
+  });
+
+  it("hydrates token from URL params and strips it", async () => {
+    const app = mountApp("/ui/overview?token=abc123");
+    await app.updateComplete;
+
+    expect(app.settings.token).toBe("abc123");
+    expect(window.location.pathname).toBe("/ui/overview");
+    expect(window.location.search).toBe("");
+  });
+
+  it("hydrates password from URL params and strips it", async () => {
+    const app = mountApp("/ui/overview?password=sekret");
+    await app.updateComplete;
+
+    expect(app.password).toBe("sekret");
+    expect(window.location.pathname).toBe("/ui/overview");
+    expect(window.location.search).toBe("");
+  });
+
+  it("strips auth params even when settings already set", async () => {
+    localStorage.setItem(
+      "clawdbot.control.settings.v1",
+      JSON.stringify({ token: "existing-token" }),
+    );
+    const app = mountApp("/ui/overview?token=abc123");
+    await app.updateComplete;
+
+    expect(app.settings.token).toBe("existing-token");
+    expect(window.location.pathname).toBe("/ui/overview");
+    expect(window.location.search).toBe("");
   });
 });

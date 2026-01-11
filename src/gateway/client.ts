@@ -3,12 +3,20 @@ import { WebSocket } from "ws";
 import { rawDataToString } from "../infra/ws.js";
 import { logDebug, logError } from "../logger.js";
 import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+  type GatewayClientMode,
+  type GatewayClientName,
+} from "../utils/message-provider.js";
+import {
   type ConnectParams,
   type EventFrame,
   type HelloOk,
   PROTOCOL_VERSION,
   type RequestFrame,
+  validateEventFrame,
   validateRequestFrame,
+  validateResponseFrame,
 } from "./protocol/index.js";
 
 type Pending = {
@@ -22,17 +30,30 @@ export type GatewayClientOptions = {
   token?: string;
   password?: string;
   instanceId?: string;
-  clientName?: string;
+  clientName?: GatewayClientName;
+  clientDisplayName?: string;
   clientVersion?: string;
   platform?: string;
-  mode?: string;
+  mode?: GatewayClientMode;
   minProtocol?: number;
   maxProtocol?: number;
   onEvent?: (evt: EventFrame) => void;
   onHelloOk?: (hello: HelloOk) => void;
+  onConnectError?: (err: Error) => void;
   onClose?: (code: number, reason: string) => void;
   onGap?: (info: { expected: number; received: number }) => void;
 };
+
+export const GATEWAY_CLOSE_CODE_HINTS: Readonly<Record<number, string>> = {
+  1000: "normal closure",
+  1006: "abnormal closure (no close frame)",
+  1008: "policy violation",
+  1012: "service restart",
+};
+
+export function describeGatewayCloseCode(code: number): string | undefined {
+  return GATEWAY_CLOSE_CODE_HINTS[code];
+}
 
 export class GatewayClient {
   private ws: WebSocket | null = null;
@@ -95,10 +116,11 @@ export class GatewayClient {
       minProtocol: this.opts.minProtocol ?? PROTOCOL_VERSION,
       maxProtocol: this.opts.maxProtocol ?? PROTOCOL_VERSION,
       client: {
-        name: this.opts.clientName ?? "gateway-client",
+        id: this.opts.clientName ?? GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+        displayName: this.opts.clientDisplayName,
         version: this.opts.clientVersion ?? "dev",
         platform: this.opts.platform ?? process.platform,
-        mode: this.opts.mode ?? "backend",
+        mode: this.opts.mode ?? GATEWAY_CLIENT_MODES.BACKEND,
         instanceId: this.opts.instanceId,
       },
       caps: [],
@@ -117,7 +139,12 @@ export class GatewayClient {
         this.opts.onHelloOk?.(helloOk);
       })
       .catch((err) => {
-        logError(`gateway connect failed: ${String(err)}`);
+        this.opts.onConnectError?.(
+          err instanceof Error ? err : new Error(String(err)),
+        );
+        const msg = `gateway connect failed: ${String(err)}`;
+        if (this.opts.mode === GATEWAY_CLIENT_MODES.PROBE) logDebug(msg);
+        else logError(msg);
         this.ws?.close(1008, "connect failed");
       });
   }
@@ -125,7 +152,7 @@ export class GatewayClient {
   private handleMessage(raw: string) {
     try {
       const parsed = JSON.parse(raw);
-      if (parsed?.type === "event") {
+      if (validateEventFrame(parsed)) {
         const evt = parsed as EventFrame;
         const seq = typeof evt.seq === "number" ? evt.seq : null;
         if (seq !== null) {
@@ -140,11 +167,12 @@ export class GatewayClient {
         this.opts.onEvent?.(evt);
         return;
       }
-      if (parsed?.type === "res") {
+      if (validateResponseFrame(parsed)) {
         const pending = this.pending.get(parsed.id);
         if (!pending) return;
         // If the payload is an ack with status accepted, keep waiting for final.
-        const status = parsed.payload?.status;
+        const payload = parsed.payload as { status?: unknown } | undefined;
+        const status = payload?.status;
         if (pending.expectFinal && status === "accepted") {
           return;
         }

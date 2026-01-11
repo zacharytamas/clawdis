@@ -1,9 +1,14 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { AgentTool, AgentToolResult } from "@mariozechner/pi-ai";
-import { StringEnum } from "@mariozechner/pi-ai";
+import { existsSync, statSync } from "node:fs";
+import fs from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
 
+import { logInfo } from "../logger.js";
+import { sliceUtf16Safe } from "../utils.js";
 import {
   addSession,
   appendOutput,
@@ -17,6 +22,7 @@ import {
   markExited,
   setJobTtlMs,
 } from "./bash-process-registry.js";
+import { assertSandboxPath } from "./sandbox-paths.js";
 import {
   getShellConfig,
   killProcessTree,
@@ -30,14 +36,50 @@ const DEFAULT_MAX_OUTPUT = clampNumber(
   1_000,
   150_000,
 );
+const DEFAULT_PATH =
+  process.env.PATH ??
+  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+// NOTE: Using Type.Unsafe with enum instead of Type.Union([Type.Literal(...)])
+// because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
+// Type.Union of literals compiles to { anyOf: [{enum:["a"]}, {enum:["b"]}, ...] }
+// which is valid but not accepted. A flat enum { type: "string", enum: [...] } works.
+const _stringEnum = <T extends readonly string[]>(
+  values: T,
+  options?: { description?: string },
+) =>
+  Type.Unsafe<T[number]>({
+    type: "string",
+    enum: values as unknown as string[],
+    ...options,
+  });
 
 export type BashToolDefaults = {
   backgroundMs?: number;
   timeoutSec?: number;
+  sandbox?: BashSandboxConfig;
+  elevated?: BashElevatedDefaults;
+  allowBackground?: boolean;
+  scopeKey?: string;
+  cwd?: string;
 };
 
 export type ProcessToolDefaults = {
   cleanupMs?: number;
+  scopeKey?: string;
+};
+
+export type BashSandboxConfig = {
+  containerName: string;
+  workspaceDir: string;
+  containerWorkdir: string;
+  env?: Record<string, string>;
+};
+
+export type BashElevatedDefaults = {
+  enabled: boolean;
+  allowed: boolean;
+  defaultLevel: "on" | "off";
 };
 
 const bashSchema = Type.Object({
@@ -48,7 +90,7 @@ const bashSchema = Type.Object({
   env: Type.Optional(Type.Record(Type.String(), Type.String())),
   yieldMs: Type.Optional(
     Type.Number({
-      description: "Milliseconds to wait before backgrounding (default 20000)",
+      description: "Milliseconds to wait before backgrounding (default 10000)",
     }),
   ),
   background: Type.Optional(
@@ -59,9 +101,9 @@ const bashSchema = Type.Object({
       description: "Timeout in seconds (optional, kills process on expiry)",
     }),
   ),
-  stdinMode: Type.Optional(
-    StringEnum(["pipe", "pty"] as const, {
-      description: "Only pipe is supported",
+  elevated: Type.Optional(
+    Type.Boolean({
+      description: "Run on the host with elevated permissions (if allowed)",
     }),
   ),
 });
@@ -72,6 +114,7 @@ export type BashToolDetails =
       sessionId: string;
       pid?: number;
       startedAt: number;
+      cwd?: string;
       tail?: string;
     }
   | {
@@ -79,17 +122,20 @@ export type BashToolDetails =
       exitCode: number | null;
       durationMs: number;
       aggregated: string;
+      cwd?: string;
     };
 
 export function createBashTool(
   defaults?: BashToolDefaults,
-): AgentTool<typeof bashSchema, BashToolDetails> {
+  // biome-ignore lint/suspicious/noExplicitAny: TypeBox schema type from pi-agent-core uses a different module instance.
+): AgentTool<any, BashToolDetails> {
   const defaultBackgroundMs = clampNumber(
     defaults?.backgroundMs ?? readEnvInt("PI_BASH_YIELD_MS"),
-    20_000,
+    10_000,
     10,
     120_000,
   );
+  const allowBackground = defaults?.allowBackground ?? true;
   const defaultTimeoutSec =
     typeof defaults?.timeoutSec === "number" && defaults.timeoutSec > 0
       ? defaults.timeoutSec
@@ -99,7 +145,7 @@ export function createBashTool(
     name: "bash",
     label: "bash",
     description:
-      "Execute bash with background continuation. Use yieldMs/background to continue later via process tool.",
+      "Execute bash with background continuation. Use yieldMs/background to continue later via process tool. For real TTY mode, use the tmux skill.",
     parameters: bashSchema,
     execute: async (_toolCallId, args, signal, onUpdate) => {
       const params = args as {
@@ -109,46 +155,133 @@ export function createBashTool(
         yieldMs?: number;
         background?: boolean;
         timeout?: number;
-        stdinMode?: "pipe" | "pty";
+        elevated?: boolean;
       };
 
       if (!params.command) {
         throw new Error("Provide a command to start.");
       }
-      if (params.stdinMode && params.stdinMode !== "pipe") {
-        throw new Error('Only stdinMode "pipe" is supported right now.');
-      }
 
-      const yieldWindow = params.background
-        ? 0
-        : clampNumber(
-            params.yieldMs ?? defaultBackgroundMs,
-            defaultBackgroundMs,
-            10,
-            120_000,
-          );
       const maxOutput = DEFAULT_MAX_OUTPUT;
       const startedAt = Date.now();
       const sessionId = randomUUID();
-      const workdir = params.workdir?.trim() || process.cwd();
+      const warnings: string[] = [];
+      const backgroundRequested = params.background === true;
+      const yieldRequested = typeof params.yieldMs === "number";
+      if (!allowBackground && (backgroundRequested || yieldRequested)) {
+        warnings.push(
+          "Warning: background execution is disabled; running synchronously.",
+        );
+      }
+      const yieldWindow = allowBackground
+        ? backgroundRequested
+          ? 0
+          : clampNumber(
+              params.yieldMs ?? defaultBackgroundMs,
+              defaultBackgroundMs,
+              10,
+              120_000,
+            )
+        : null;
+      const elevatedDefaults = defaults?.elevated;
+      const elevatedDefaultOn =
+        elevatedDefaults?.defaultLevel === "on" &&
+        elevatedDefaults.enabled &&
+        elevatedDefaults.allowed;
+      const elevatedRequested =
+        typeof params.elevated === "boolean"
+          ? params.elevated
+          : elevatedDefaultOn;
+      if (elevatedRequested) {
+        if (!elevatedDefaults?.enabled || !elevatedDefaults.allowed) {
+          const runtime = defaults?.sandbox ? "sandboxed" : "direct";
+          const gates: string[] = [];
+          if (!elevatedDefaults?.enabled) {
+            gates.push(
+              "enabled (tools.elevated.enabled / agents.list[].tools.elevated.enabled)",
+            );
+          } else {
+            gates.push(
+              "allowFrom (tools.elevated.allowFrom.<provider> / agents.list[].tools.elevated.allowFrom.<provider>)",
+            );
+          }
+          throw new Error(
+            [
+              `elevated is not available right now (runtime=${runtime}).`,
+              `Failing gates: ${gates.join(", ")}`,
+              "Fix-it keys:",
+              "- tools.elevated.enabled",
+              "- tools.elevated.allowFrom.<provider>",
+              "- agents.list[].tools.elevated.enabled",
+              "- agents.list[].tools.elevated.allowFrom.<provider>",
+            ].join("\n"),
+          );
+        }
+        logInfo(
+          `bash: elevated command (${sessionId.slice(0, 8)}) ${truncateMiddle(
+            params.command,
+            120,
+          )}`,
+        );
+      }
+
+      const sandbox = elevatedRequested ? undefined : defaults?.sandbox;
+      const rawWorkdir =
+        params.workdir?.trim() || defaults?.cwd || process.cwd();
+      let workdir = rawWorkdir;
+      let containerWorkdir = sandbox?.containerWorkdir;
+      if (sandbox) {
+        const resolved = await resolveSandboxWorkdir({
+          workdir: rawWorkdir,
+          sandbox,
+          warnings,
+        });
+        workdir = resolved.hostWorkdir;
+        containerWorkdir = resolved.containerWorkdir;
+      } else {
+        workdir = resolveWorkdir(rawWorkdir, warnings);
+      }
 
       const { shell, args: shellArgs } = getShellConfig();
-      const env = params.env ? { ...process.env, ...params.env } : process.env;
-      const child: ChildProcessWithoutNullStreams = spawn(
-        shell,
-        [...shellArgs, params.command],
-        {
-          cwd: workdir,
-          env,
-          detached: true,
-          stdio: ["pipe", "pipe", "pipe"],
-        },
-      );
+      const baseEnv = coerceEnv(process.env);
+      const mergedEnv = params.env ? { ...baseEnv, ...params.env } : baseEnv;
+      const env = sandbox
+        ? buildSandboxEnv({
+            paramsEnv: params.env,
+            sandboxEnv: sandbox.env,
+            containerWorkdir: containerWorkdir ?? sandbox.containerWorkdir,
+          })
+        : mergedEnv;
+      const child = sandbox
+        ? spawn(
+            "docker",
+            buildDockerExecArgs({
+              containerName: sandbox.containerName,
+              command: params.command,
+              workdir: containerWorkdir ?? sandbox.containerWorkdir,
+              env,
+              tty: false,
+            }),
+            {
+              cwd: workdir,
+              env: process.env,
+              detached: true,
+              stdio: ["pipe", "pipe", "pipe"],
+            },
+          )
+        : spawn(shell, [...shellArgs, params.command], {
+            cwd: workdir,
+            env,
+            detached: true,
+            stdio: ["pipe", "pipe", "pipe"],
+          });
 
       const session = {
         id: sessionId,
         command: params.command,
+        scopeKey: defaults?.scopeKey,
         child,
+        pid: child?.pid,
         startedAt,
         cwd: workdir,
         maxOutputChars: maxOutput,
@@ -178,9 +311,7 @@ export function createBashTool(
       };
 
       const onAbort = () => {
-        if (child.pid) {
-          killProcessTree(child.pid);
-        }
+        killSession(session);
       };
 
       if (signal?.aborted) onAbort();
@@ -200,13 +331,15 @@ export function createBashTool(
       const emitUpdate = () => {
         if (!onUpdate) return;
         const tailText = session.tail || session.aggregated;
+        const warningText = warnings.length ? `${warnings.join("\n")}\n\n` : "";
         onUpdate({
-          content: [{ type: "text", text: tailText || "" }],
+          content: [{ type: "text", text: warningText + (tailText || "") }],
           details: {
             status: "running",
             sessionId,
-            pid: child.pid ?? undefined,
+            pid: session.pid ?? undefined,
             startedAt,
+            cwd: session.cwd,
             tail: session.tail,
           },
         });
@@ -237,15 +370,17 @@ export function createBashTool(
                   {
                     type: "text",
                     text:
-                      `Command still running (session ${sessionId}, pid ${child.pid ?? "n/a"}). ` +
+                      `${warnings.length ? `${warnings.join("\n")}\n\n` : ""}` +
+                      `Command still running (session ${sessionId}, pid ${session.pid ?? "n/a"}). ` +
                       "Use process (list/poll/log/write/kill/clear/remove) for follow-up.",
                   },
                 ],
                 details: {
                   status: "running",
                   sessionId,
-                  pid: child.pid ?? undefined,
+                  pid: session.pid ?? undefined,
                   startedAt,
+                  cwd: session.cwd,
                   tail: session.tail,
                 },
               }),
@@ -260,18 +395,23 @@ export function createBashTool(
             resolveRunning();
           };
 
-          if (yieldWindow === 0) {
-            onYieldNow();
-          } else {
-            yieldTimer = setTimeout(() => {
-              if (settled) return;
-              yielded = true;
-              markBackgrounded(session);
-              resolveRunning();
-            }, yieldWindow);
+          if (allowBackground && yieldWindow !== null) {
+            if (yieldWindow === 0) {
+              onYieldNow();
+            } else {
+              yieldTimer = setTimeout(() => {
+                if (settled) return;
+                yielded = true;
+                markBackgrounded(session);
+                resolveRunning();
+              }, yieldWindow);
+            }
           }
 
-          child.once("exit", (code, exitSignal) => {
+          const handleExit = (
+            code: number | null,
+            exitSignal: NodeJS.Signals | number | null,
+          ) => {
             if (yieldTimer) clearTimeout(yieldTimer);
             if (timeoutTimer) clearTimeout(timeoutTimer);
             const durationMs = Date.now() - startedAt;
@@ -303,15 +443,29 @@ export function createBashTool(
 
             settle(() =>
               resolve({
-                content: [{ type: "text", text: aggregated || "(no output)" }],
+                content: [
+                  {
+                    type: "text",
+                    text:
+                      `${warnings.length ? `${warnings.join("\n")}\n\n` : ""}` +
+                      (aggregated || "(no output)"),
+                  },
+                ],
                 details: {
                   status: "completed",
                   exitCode: code ?? 0,
                   durationMs,
                   aggregated,
+                  cwd: session.cwd,
                 },
               }),
             );
+          };
+
+          // `exit` can fire before stdio fully flushes (notably on Windows).
+          // `close` waits for streams to close, so aggregated output is complete.
+          child.once("close", (code, exitSignal) => {
+            handleExit(code, exitSignal);
           });
 
           child.once("error", (err) => {
@@ -329,12 +483,7 @@ export function createBashTool(
 export const bashTool = createBashTool();
 
 const processSchema = Type.Object({
-  action: StringEnum(
-    ["list", "poll", "log", "write", "kill", "clear", "remove"] as const,
-    {
-      description: "Process action",
-    },
-  ),
+  action: Type.String({ description: "Process action" }),
   sessionId: Type.Optional(
     Type.String({ description: "Session id for actions other than list" }),
   ),
@@ -346,10 +495,14 @@ const processSchema = Type.Object({
 
 export function createProcessTool(
   defaults?: ProcessToolDefaults,
-): AgentTool<typeof processSchema> {
+  // biome-ignore lint/suspicious/noExplicitAny: TypeBox schema type from pi-agent-core uses a different module instance.
+): AgentTool<any> {
   if (defaults?.cleanupMs !== undefined) {
     setJobTtlMs(defaults.cleanupMs);
   }
+  const scopeKey = defaults?.scopeKey;
+  const isInScope = (session?: { scopeKey?: string } | null) =>
+    !scopeKey || session?.scopeKey === scopeKey;
 
   return {
     name: "process",
@@ -367,32 +520,36 @@ export function createProcessTool(
       };
 
       if (params.action === "list") {
-        const running = listRunningSessions().map((s) => ({
-          sessionId: s.id,
-          status: "running",
-          pid: s.child.pid ?? undefined,
-          startedAt: s.startedAt,
-          runtimeMs: Date.now() - s.startedAt,
-          cwd: s.cwd,
-          command: s.command,
-          name: deriveSessionName(s.command),
-          tail: s.tail,
-          truncated: s.truncated,
-        }));
-        const finished = listFinishedSessions().map((s) => ({
-          sessionId: s.id,
-          status: s.status,
-          startedAt: s.startedAt,
-          endedAt: s.endedAt,
-          runtimeMs: s.endedAt - s.startedAt,
-          cwd: s.cwd,
-          command: s.command,
-          name: deriveSessionName(s.command),
-          tail: s.tail,
-          truncated: s.truncated,
-          exitCode: s.exitCode ?? undefined,
-          exitSignal: s.exitSignal ?? undefined,
-        }));
+        const running = listRunningSessions()
+          .filter((s) => isInScope(s))
+          .map((s) => ({
+            sessionId: s.id,
+            status: "running",
+            pid: s.pid ?? undefined,
+            startedAt: s.startedAt,
+            runtimeMs: Date.now() - s.startedAt,
+            cwd: s.cwd,
+            command: s.command,
+            name: deriveSessionName(s.command),
+            tail: s.tail,
+            truncated: s.truncated,
+          }));
+        const finished = listFinishedSessions()
+          .filter((s) => isInScope(s))
+          .map((s) => ({
+            sessionId: s.id,
+            status: s.status,
+            startedAt: s.startedAt,
+            endedAt: s.endedAt,
+            runtimeMs: s.endedAt - s.startedAt,
+            cwd: s.cwd,
+            command: s.command,
+            name: deriveSessionName(s.command),
+            tail: s.tail,
+            truncated: s.truncated,
+            exitCode: s.exitCode ?? undefined,
+            exitSignal: s.exitSignal ?? undefined,
+          }));
         const lines = [...running, ...finished]
           .sort((a, b) => b.startedAt - a.startedAt)
           .map((s) => {
@@ -426,34 +583,38 @@ export function createProcessTool(
 
       const session = getSession(params.sessionId);
       const finished = getFinishedSession(params.sessionId);
+      const scopedSession = isInScope(session) ? session : undefined;
+      const scopedFinished = isInScope(finished) ? finished : undefined;
 
       switch (params.action) {
         case "poll": {
-          if (!session) {
-            if (finished) {
+          if (!scopedSession) {
+            if (scopedFinished) {
               return {
                 content: [
                   {
                     type: "text",
                     text:
-                      (finished.tail ||
+                      (scopedFinished.tail ||
                         `(no output recorded${
-                          finished.truncated ? " — truncated to cap" : ""
+                          scopedFinished.truncated ? " — truncated to cap" : ""
                         })`) +
                       `\n\nProcess exited with ${
-                        finished.exitSignal
-                          ? `signal ${finished.exitSignal}`
-                          : `code ${finished.exitCode ?? 0}`
+                        scopedFinished.exitSignal
+                          ? `signal ${scopedFinished.exitSignal}`
+                          : `code ${scopedFinished.exitCode ?? 0}`
                       }.`,
                   },
                 ],
                 details: {
                   status:
-                    finished.status === "completed" ? "completed" : "failed",
+                    scopedFinished.status === "completed"
+                      ? "completed"
+                      : "failed",
                   sessionId: params.sessionId,
-                  exitCode: finished.exitCode ?? undefined,
-                  aggregated: finished.aggregated,
-                  name: deriveSessionName(finished.command),
+                  exitCode: scopedFinished.exitCode ?? undefined,
+                  aggregated: scopedFinished.aggregated,
+                  name: deriveSessionName(scopedFinished.command),
                 },
               };
             }
@@ -467,7 +628,7 @@ export function createProcessTool(
               details: { status: "failed" },
             };
           }
-          if (!session.backgrounded) {
+          if (!scopedSession.backgrounded) {
             return {
               content: [
                 {
@@ -478,17 +639,17 @@ export function createProcessTool(
               details: { status: "failed" },
             };
           }
-          const { stdout, stderr } = drainSession(session);
-          const exited = session.exited;
-          const exitCode = session.exitCode ?? 0;
-          const exitSignal = session.exitSignal ?? undefined;
+          const { stdout, stderr } = drainSession(scopedSession);
+          const exited = scopedSession.exited;
+          const exitCode = scopedSession.exitCode ?? 0;
+          const exitSignal = scopedSession.exitSignal ?? undefined;
           if (exited) {
             const status =
               exitCode === 0 && exitSignal == null ? "completed" : "failed";
             markExited(
-              session,
-              session.exitCode ?? null,
-              session.exitSignal ?? null,
+              scopedSession,
+              scopedSession.exitCode ?? null,
+              scopedSession.exitSignal ?? null,
               status,
             );
           }
@@ -518,15 +679,15 @@ export function createProcessTool(
               status,
               sessionId: params.sessionId,
               exitCode: exited ? exitCode : undefined,
-              aggregated: session.aggregated,
-              name: deriveSessionName(session.command),
+              aggregated: scopedSession.aggregated,
+              name: deriveSessionName(scopedSession.command),
             },
           };
         }
 
         case "log": {
-          if (session) {
-            if (!session.backgrounded) {
+          if (scopedSession) {
+            if (!scopedSession.backgrounded) {
               return {
                 content: [
                   {
@@ -538,31 +699,31 @@ export function createProcessTool(
               };
             }
             const { slice, totalLines, totalChars } = sliceLogLines(
-              session.aggregated,
+              scopedSession.aggregated,
               params.offset,
               params.limit,
             );
             return {
               content: [{ type: "text", text: slice || "(no output yet)" }],
               details: {
-                status: session.exited ? "completed" : "running",
+                status: scopedSession.exited ? "completed" : "running",
                 sessionId: params.sessionId,
                 total: totalLines,
                 totalLines,
                 totalChars,
-                truncated: session.truncated,
-                name: deriveSessionName(session.command),
+                truncated: scopedSession.truncated,
+                name: deriveSessionName(scopedSession.command),
               },
             };
           }
-          if (finished) {
+          if (scopedFinished) {
             const { slice, totalLines, totalChars } = sliceLogLines(
-              finished.aggregated,
+              scopedFinished.aggregated,
               params.offset,
               params.limit,
             );
             const status =
-              finished.status === "completed" ? "completed" : "failed";
+              scopedFinished.status === "completed" ? "completed" : "failed";
             return {
               content: [
                 { type: "text", text: slice || "(no output recorded)" },
@@ -573,10 +734,10 @@ export function createProcessTool(
                 total: totalLines,
                 totalLines,
                 totalChars,
-                truncated: finished.truncated,
-                exitCode: finished.exitCode ?? undefined,
-                exitSignal: finished.exitSignal ?? undefined,
-                name: deriveSessionName(finished.command),
+                truncated: scopedFinished.truncated,
+                exitCode: scopedFinished.exitCode ?? undefined,
+                exitSignal: scopedFinished.exitSignal ?? undefined,
+                name: deriveSessionName(scopedFinished.command),
               },
             };
           }
@@ -592,7 +753,7 @@ export function createProcessTool(
         }
 
         case "write": {
-          if (!session) {
+          if (!scopedSession) {
             return {
               content: [
                 {
@@ -603,7 +764,7 @@ export function createProcessTool(
               details: { status: "failed" },
             };
           }
-          if (!session.backgrounded) {
+          if (!scopedSession.backgrounded) {
             return {
               content: [
                 {
@@ -614,7 +775,10 @@ export function createProcessTool(
               details: { status: "failed" },
             };
           }
-          if (!session.child.stdin || session.child.stdin.destroyed) {
+          if (
+            !scopedSession.child?.stdin ||
+            scopedSession.child.stdin.destroyed
+          ) {
             return {
               content: [
                 {
@@ -626,13 +790,13 @@ export function createProcessTool(
             };
           }
           await new Promise<void>((resolve, reject) => {
-            session.child.stdin.write(params.data ?? "", (err) => {
+            scopedSession.child?.stdin.write(params.data ?? "", (err) => {
               if (err) reject(err);
               else resolve();
             });
           });
           if (params.eof) {
-            session.child.stdin.end();
+            scopedSession.child.stdin.end();
           }
           return {
             content: [
@@ -646,13 +810,15 @@ export function createProcessTool(
             details: {
               status: "running",
               sessionId: params.sessionId,
-              name: session ? deriveSessionName(session.command) : undefined,
+              name: scopedSession
+                ? deriveSessionName(scopedSession.command)
+                : undefined,
             },
           };
         }
 
         case "kill": {
-          if (!session) {
+          if (!scopedSession) {
             return {
               content: [
                 {
@@ -663,7 +829,7 @@ export function createProcessTool(
               details: { status: "failed" },
             };
           }
-          if (!session.backgrounded) {
+          if (!scopedSession.backgrounded) {
             return {
               content: [
                 {
@@ -674,23 +840,23 @@ export function createProcessTool(
               details: { status: "failed" },
             };
           }
-          if (session.child.pid) {
-            killProcessTree(session.child.pid);
-          }
-          markExited(session, null, "SIGKILL", "failed");
+          killSession(scopedSession);
+          markExited(scopedSession, null, "SIGKILL", "failed");
           return {
             content: [
               { type: "text", text: `Killed session ${params.sessionId}.` },
             ],
             details: {
               status: "failed",
-              name: session ? deriveSessionName(session.command) : undefined,
+              name: scopedSession
+                ? deriveSessionName(scopedSession.command)
+                : undefined,
             },
           };
         }
 
         case "clear": {
-          if (finished) {
+          if (scopedFinished) {
             deleteSession(params.sessionId);
             return {
               content: [
@@ -711,22 +877,22 @@ export function createProcessTool(
         }
 
         case "remove": {
-          if (session) {
-            if (session.child.pid) {
-              killProcessTree(session.child.pid);
-            }
-            markExited(session, null, "SIGKILL", "failed");
+          if (scopedSession) {
+            killSession(scopedSession);
+            markExited(scopedSession, null, "SIGKILL", "failed");
             return {
               content: [
                 { type: "text", text: `Removed session ${params.sessionId}.` },
               ],
               details: {
                 status: "failed",
-                name: session ? deriveSessionName(session.command) : undefined,
+                name: scopedSession
+                  ? deriveSessionName(scopedSession.command)
+                  : undefined,
               },
             };
           }
-          if (finished) {
+          if (scopedFinished) {
             deleteSession(params.sessionId);
             return {
               content: [
@@ -759,6 +925,120 @@ export function createProcessTool(
 
 export const processTool = createProcessTool();
 
+function buildSandboxEnv(params: {
+  paramsEnv?: Record<string, string>;
+  sandboxEnv?: Record<string, string>;
+  containerWorkdir: string;
+}) {
+  const env: Record<string, string> = {
+    PATH: DEFAULT_PATH,
+    HOME: params.containerWorkdir,
+  };
+  for (const [key, value] of Object.entries(params.sandboxEnv ?? {})) {
+    env[key] = value;
+  }
+  for (const [key, value] of Object.entries(params.paramsEnv ?? {})) {
+    env[key] = value;
+  }
+  return env;
+}
+
+function coerceEnv(env?: NodeJS.ProcessEnv | Record<string, string>) {
+  const record: Record<string, string> = {};
+  if (!env) return record;
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string") record[key] = value;
+  }
+  return record;
+}
+
+function buildDockerExecArgs(params: {
+  containerName: string;
+  command: string;
+  workdir?: string;
+  env: Record<string, string>;
+  tty: boolean;
+}) {
+  const args = ["exec", "-i"];
+  if (params.tty) args.push("-t");
+  if (params.workdir) {
+    args.push("-w", params.workdir);
+  }
+  for (const [key, value] of Object.entries(params.env)) {
+    args.push("-e", `${key}=${value}`);
+  }
+  args.push(params.containerName, "sh", "-lc", params.command);
+  return args;
+}
+
+async function resolveSandboxWorkdir(params: {
+  workdir: string;
+  sandbox: BashSandboxConfig;
+  warnings: string[];
+}) {
+  const fallback = params.sandbox.workspaceDir;
+  try {
+    const resolved = await assertSandboxPath({
+      filePath: params.workdir,
+      cwd: process.cwd(),
+      root: params.sandbox.workspaceDir,
+    });
+    const stats = await fs.stat(resolved.resolved);
+    if (!stats.isDirectory()) {
+      throw new Error("workdir is not a directory");
+    }
+    const relative = resolved.relative
+      ? resolved.relative.split(path.sep).join(path.posix.sep)
+      : "";
+    const containerWorkdir = relative
+      ? path.posix.join(params.sandbox.containerWorkdir, relative)
+      : params.sandbox.containerWorkdir;
+    return { hostWorkdir: resolved.resolved, containerWorkdir };
+  } catch {
+    params.warnings.push(
+      `Warning: workdir "${params.workdir}" is unavailable; using "${fallback}".`,
+    );
+    return {
+      hostWorkdir: fallback,
+      containerWorkdir: params.sandbox.containerWorkdir,
+    };
+  }
+}
+
+function killSession(session: {
+  pid?: number;
+  child?: ChildProcessWithoutNullStreams;
+}) {
+  const pid = session.pid ?? session.child?.pid;
+  if (pid) {
+    killProcessTree(pid);
+  }
+}
+
+function resolveWorkdir(workdir: string, warnings: string[]) {
+  const current = safeCwd();
+  const fallback = current ?? homedir();
+  try {
+    const stats = statSync(workdir);
+    if (stats.isDirectory()) return workdir;
+  } catch {
+    // ignore, fallback below
+  }
+  warnings.push(
+    `Warning: workdir "${workdir}" is unavailable; using "${fallback}".`,
+  );
+  return fallback;
+}
+
+function safeCwd() {
+  try {
+    const cwd = process.cwd();
+    return existsSync(cwd) ? cwd : null;
+  } catch {
+    return null;
+  }
+}
+
 function clampNumber(
   value: number | undefined,
   defaultValue: number,
@@ -787,7 +1067,7 @@ function chunkString(input: string, limit = CHUNK_LIMIT) {
 function truncateMiddle(str: string, max: number) {
   if (str.length <= max) return str;
   const half = Math.floor((max - 3) / 2);
-  return `${str.slice(0, half)}...${str.slice(str.length - half)}`;
+  return `${sliceUtf16Safe(str, 0, half)}...${sliceUtf16Safe(str, -half)}`;
 }
 
 function sliceLogLines(

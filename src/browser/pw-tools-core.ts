@@ -17,12 +17,12 @@ function requireRef(value: unknown): string {
 }
 
 export async function snapshotAiViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   timeoutMs?: number;
 }): Promise<{ snapshot: string }> {
   const page = await getPageForTargetId({
-    cdpPort: opts.cdpPort,
+    cdpUrl: opts.cdpUrl,
     targetId: opts.targetId,
   });
   ensurePageState(page);
@@ -45,7 +45,7 @@ export async function snapshotAiViaPlaywright(opts: {
 }
 
 export async function clickViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   ref: string;
   doubleClick?: boolean;
@@ -54,7 +54,7 @@ export async function clickViaPlaywright(opts: {
   timeoutMs?: number;
 }): Promise<void> {
   const page = await getPageForTargetId({
-    cdpPort: opts.cdpPort,
+    cdpUrl: opts.cdpUrl,
     targetId: opts.targetId,
   });
   ensurePageState(page);
@@ -79,7 +79,7 @@ export async function clickViaPlaywright(opts: {
 }
 
 export async function hoverViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   ref: string;
   timeoutMs?: number;
@@ -94,7 +94,7 @@ export async function hoverViaPlaywright(opts: {
 }
 
 export async function dragViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   startRef: string;
   endRef: string;
@@ -111,7 +111,7 @@ export async function dragViaPlaywright(opts: {
 }
 
 export async function selectOptionViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   ref: string;
   values: string[];
@@ -128,7 +128,7 @@ export async function selectOptionViaPlaywright(opts: {
 }
 
 export async function pressKeyViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   key: string;
   delayMs?: number;
@@ -143,7 +143,7 @@ export async function pressKeyViaPlaywright(opts: {
 }
 
 export async function typeViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   ref: string;
   text: string;
@@ -168,7 +168,7 @@ export async function typeViaPlaywright(opts: {
 }
 
 export async function fillFormViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   fields: BrowserFormField[];
 }): Promise<void> {
@@ -200,7 +200,7 @@ export async function fillFormViaPlaywright(opts: {
 }
 
 export async function evaluateViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   fn: string;
   ref?: string;
@@ -211,53 +211,44 @@ export async function evaluateViaPlaywright(opts: {
   ensurePageState(page);
   if (opts.ref) {
     const locator = refLocator(page, opts.ref);
-    return await locator.evaluate((el, fnBody) => {
-      const compileRunner = (body: string) => {
-        const inner = `"use strict"; const candidate = ${body}; return typeof candidate === "function" ? candidate(element) : candidate;`;
-        // This intentionally evaluates user-supplied code in the browser context.
-        // oxlint-disable-next-line typescript-eslint/no-implied-eval
-        return new Function("element", inner) as (element: Element) => unknown;
-      };
-      let compiled: unknown;
+    // Use Function constructor at runtime to avoid esbuild adding __name helper
+    // which doesn't exist in the browser context
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- required for browser-context eval
+    const elementEvaluator = new Function(
+      "el",
+      "fnBody",
+      `
+      "use strict";
       try {
-        compiled = compileRunner(fnBody);
+        var candidate = eval("(" + fnBody + ")");
+        return typeof candidate === "function" ? candidate(el) : candidate;
       } catch (err) {
-        const message =
-          err instanceof Error
-            ? err.message
-            : typeof err === "string"
-              ? err
-              : "invalid expression";
-        throw new Error(`Invalid evaluate function: ${message}`);
+        throw new Error("Invalid evaluate function: " + (err && err.message ? err.message : String(err)));
       }
-      return (compiled as (element: Element) => unknown)(el as Element);
-    }, fnText);
+      `,
+    ) as (el: Element, fnBody: string) => unknown;
+    return await locator.evaluate(elementEvaluator, fnText);
   }
-  return await page.evaluate((fnBody) => {
-    const compileRunner = (body: string) => {
-      const inner = `"use strict"; const candidate = ${body}; return typeof candidate === "function" ? candidate() : candidate;`;
-      // This intentionally evaluates user-supplied code in the browser context.
-      // oxlint-disable-next-line typescript-eslint/no-implied-eval
-      return new Function(inner) as () => unknown;
-    };
-    let compiled: unknown;
+  // Use Function constructor at runtime to avoid esbuild adding __name helper
+  // which doesn't exist in the browser context
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- required for browser-context eval
+  const browserEvaluator = new Function(
+    "fnBody",
+    `
+    "use strict";
     try {
-      compiled = compileRunner(fnBody);
+      var candidate = eval("(" + fnBody + ")");
+      return typeof candidate === "function" ? candidate() : candidate;
     } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : typeof err === "string"
-            ? err
-            : "invalid expression";
-      throw new Error(`Invalid evaluate function: ${message}`);
+      throw new Error("Invalid evaluate function: " + (err && err.message ? err.message : String(err)));
     }
-    return (compiled as () => unknown)();
-  }, fnText);
+    `,
+  ) as (fnBody: string) => unknown;
+  return await page.evaluate(browserEvaluator, fnText);
 }
 
 export async function armFileUploadViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   paths?: string[];
   timeoutMs?: number;
@@ -286,7 +277,7 @@ export async function armFileUploadViaPlaywright(opts: {
       try {
         const input =
           typeof fileChooser.element === "function"
-            ? await fileChooser.element()
+            ? await Promise.resolve(fileChooser.element())
             : null;
         if (input) {
           await input.evaluate((el) => {
@@ -304,7 +295,7 @@ export async function armFileUploadViaPlaywright(opts: {
 }
 
 export async function setInputFilesViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   inputRef?: string;
   element?: string;
@@ -342,7 +333,7 @@ export async function setInputFilesViaPlaywright(opts: {
 }
 
 export async function armDialogViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   accept: boolean;
   promptText?: string;
@@ -368,7 +359,7 @@ export async function armDialogViaPlaywright(opts: {
 }
 
 export async function navigateViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   url: string;
   timeoutMs?: number;
@@ -384,7 +375,7 @@ export async function navigateViaPlaywright(opts: {
 }
 
 export async function waitForViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   timeMs?: number;
   text?: string;
@@ -417,7 +408,7 @@ export async function waitForViaPlaywright(opts: {
 }
 
 export async function takeScreenshotViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   ref?: string;
   element?: string;
@@ -449,7 +440,7 @@ export async function takeScreenshotViaPlaywright(opts: {
 }
 
 export async function resizeViewportViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   width: number;
   height: number;
@@ -463,7 +454,7 @@ export async function resizeViewportViaPlaywright(opts: {
 }
 
 export async function closePageViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
 }): Promise<void> {
   const page = await getPageForTargetId(opts);
@@ -472,7 +463,7 @@ export async function closePageViaPlaywright(opts: {
 }
 
 export async function pdfViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
 }): Promise<{ buffer: Buffer }> {
   const page = await getPageForTargetId(opts);
@@ -498,7 +489,7 @@ function consolePriority(level: string) {
 }
 
 export async function getConsoleMessagesViaPlaywright(opts: {
-  cdpPort: number;
+  cdpUrl: string;
   targetId?: string;
   level?: string;
 }): Promise<BrowserConsoleMessage[]> {

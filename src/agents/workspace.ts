@@ -3,17 +3,30 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isSubagentSessionKey } from "../routing/session-key.js";
 import { resolveUserPath } from "../utils.js";
 
-export const DEFAULT_AGENT_WORKSPACE_DIR = path.join(os.homedir(), "clawd");
+export function resolveDefaultAgentWorkspaceDir(
+  env: NodeJS.ProcessEnv = process.env,
+  homedir: () => string = os.homedir,
+): string {
+  const profile = env.CLAWDBOT_PROFILE?.trim();
+  if (profile && profile.toLowerCase() !== "default") {
+    return path.join(homedir(), `clawd-${profile}`);
+  }
+  return path.join(homedir(), "clawd");
+}
+
+export const DEFAULT_AGENT_WORKSPACE_DIR = resolveDefaultAgentWorkspaceDir();
 export const DEFAULT_AGENTS_FILENAME = "AGENTS.md";
 export const DEFAULT_SOUL_FILENAME = "SOUL.md";
 export const DEFAULT_TOOLS_FILENAME = "TOOLS.md";
 export const DEFAULT_IDENTITY_FILENAME = "IDENTITY.md";
 export const DEFAULT_USER_FILENAME = "USER.md";
+export const DEFAULT_HEARTBEAT_FILENAME = "HEARTBEAT.md";
 export const DEFAULT_BOOTSTRAP_FILENAME = "BOOTSTRAP.md";
 
-const DEFAULT_AGENTS_TEMPLATE = `# AGENTS.md - Clawdis Workspace
+const DEFAULT_AGENTS_TEMPLATE = `# AGENTS.md - Clawdbot Workspace
 
 This folder is the assistant's working directory.
 
@@ -42,6 +55,9 @@ git commit -m "Add agent workspace"
 - On session start, read today + yesterday if present.
 - Capture durable facts, preferences, and decisions; avoid secrets.
 
+## Heartbeats (optional)
+- HEARTBEAT.md can hold a tiny checklist for heartbeat runs; keep it small.
+
 ## Customize
 - Add your preferred style, rules, and "memory" here.
 `;
@@ -58,7 +74,7 @@ Describe who the assistant is, tone, and boundaries.
 const DEFAULT_TOOLS_TEMPLATE = `# TOOLS.md - User Tool Notes (editable)
 
 This file is for *your* notes about external tools and conventions.
-It does not define which tools exist; Clawdis provides built-in tools internally.
+It does not define which tools exist; Clawdbot provides built-in tools internally.
 
 ## Examples
 
@@ -70,6 +86,11 @@ It does not define which tools exist; Clawdis provides built-in tools internally
 - Text-to-speech: specify voice, target speaker/room, and whether to stream.
 
 Add whatever else you want the assistant to know about your local toolchain.
+`;
+
+const DEFAULT_HEARTBEAT_TEMPLATE = `# HEARTBEAT.md
+
+Keep this file empty unless you want a tiny checklist. Keep it small.
 `;
 
 const DEFAULT_BOOTSTRAP_TEMPLATE = `# BOOTSTRAP.md - First Run Ritual (delete after)
@@ -108,7 +129,7 @@ After the user chooses, update:
 - Timezone (optional)
 - Notes
 
-3) ~/.clawdis/clawdis.json
+3) ~/.clawdbot/clawdbot.json
 Set identity.name, identity.theme, identity.emoji to match IDENTITY.md.
 
 ## Cleanup
@@ -163,6 +184,7 @@ export type WorkspaceBootstrapFileName =
   | typeof DEFAULT_TOOLS_FILENAME
   | typeof DEFAULT_IDENTITY_FILENAME
   | typeof DEFAULT_USER_FILENAME
+  | typeof DEFAULT_HEARTBEAT_FILENAME
   | typeof DEFAULT_BOOTSTRAP_FILENAME;
 
 export type WorkspaceBootstrapFile = {
@@ -194,6 +216,7 @@ export async function ensureAgentWorkspace(params?: {
   toolsPath?: string;
   identityPath?: string;
   userPath?: string;
+  heartbeatPath?: string;
   bootstrapPath?: string;
 }> {
   const rawDir = params?.dir?.trim()
@@ -209,7 +232,30 @@ export async function ensureAgentWorkspace(params?: {
   const toolsPath = path.join(dir, DEFAULT_TOOLS_FILENAME);
   const identityPath = path.join(dir, DEFAULT_IDENTITY_FILENAME);
   const userPath = path.join(dir, DEFAULT_USER_FILENAME);
+  const heartbeatPath = path.join(dir, DEFAULT_HEARTBEAT_FILENAME);
   const bootstrapPath = path.join(dir, DEFAULT_BOOTSTRAP_FILENAME);
+
+  const isBrandNewWorkspace = await (async () => {
+    const paths = [
+      agentsPath,
+      soulPath,
+      toolsPath,
+      identityPath,
+      userPath,
+      heartbeatPath,
+    ];
+    const existing = await Promise.all(
+      paths.map(async (p) => {
+        try {
+          await fs.access(p);
+          return true;
+        } catch {
+          return false;
+        }
+      }),
+    );
+    return existing.every((v) => !v);
+  })();
 
   const agentsTemplate = await loadTemplate(
     DEFAULT_AGENTS_FILENAME,
@@ -231,6 +277,10 @@ export async function ensureAgentWorkspace(params?: {
     DEFAULT_USER_FILENAME,
     DEFAULT_USER_TEMPLATE,
   );
+  const heartbeatTemplate = await loadTemplate(
+    DEFAULT_HEARTBEAT_FILENAME,
+    DEFAULT_HEARTBEAT_TEMPLATE,
+  );
   const bootstrapTemplate = await loadTemplate(
     DEFAULT_BOOTSTRAP_FILENAME,
     DEFAULT_BOOTSTRAP_TEMPLATE,
@@ -241,7 +291,10 @@ export async function ensureAgentWorkspace(params?: {
   await writeFileIfMissing(toolsPath, toolsTemplate);
   await writeFileIfMissing(identityPath, identityTemplate);
   await writeFileIfMissing(userPath, userTemplate);
-  await writeFileIfMissing(bootstrapPath, bootstrapTemplate);
+  await writeFileIfMissing(heartbeatPath, heartbeatTemplate);
+  if (isBrandNewWorkspace) {
+    await writeFileIfMissing(bootstrapPath, bootstrapTemplate);
+  }
 
   return {
     dir,
@@ -250,6 +303,7 @@ export async function ensureAgentWorkspace(params?: {
     toolsPath,
     identityPath,
     userPath,
+    heartbeatPath,
     bootstrapPath,
   };
 }
@@ -284,6 +338,10 @@ export async function loadWorkspaceBootstrapFiles(
       filePath: path.join(resolvedDir, DEFAULT_USER_FILENAME),
     },
     {
+      name: DEFAULT_HEARTBEAT_FILENAME,
+      filePath: path.join(resolvedDir, DEFAULT_HEARTBEAT_FILENAME),
+    },
+    {
       name: DEFAULT_BOOTSTRAP_FILENAME,
       filePath: path.join(resolvedDir, DEFAULT_BOOTSTRAP_FILENAME),
     },
@@ -304,4 +362,17 @@ export async function loadWorkspaceBootstrapFiles(
     }
   }
   return result;
+}
+
+const SUBAGENT_BOOTSTRAP_ALLOWLIST = new Set([
+  DEFAULT_AGENTS_FILENAME,
+  DEFAULT_TOOLS_FILENAME,
+]);
+
+export function filterBootstrapFilesForSession(
+  files: WorkspaceBootstrapFile[],
+  sessionKey?: string,
+): WorkspaceBootstrapFile[] {
+  if (!sessionKey || !isSubagentSessionKey(sessionKey)) return files;
+  return files.filter((file) => SUBAGENT_BOOTSTRAP_ALLOWLIST.has(file.name));
 }

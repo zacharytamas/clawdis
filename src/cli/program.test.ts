@@ -1,10 +1,16 @@
 import * as fs from "node:fs/promises";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const sendCommand = vi.fn();
+const messageCommand = vi.fn();
 const statusCommand = vi.fn();
-const loginWeb = vi.fn();
+const configureCommand = vi.fn();
+const configureCommandWithSections = vi.fn();
+const setupCommand = vi.fn();
+const onboardCommand = vi.fn();
 const callGateway = vi.fn();
+const runProviderLogin = vi.fn();
+const runProviderLogout = vi.fn();
+const runTui = vi.fn();
 
 const runtime = {
   log: vi.fn(),
@@ -14,11 +20,32 @@ const runtime = {
   }),
 };
 
-vi.mock("../commands/send.js", () => ({ sendCommand }));
+vi.mock("../commands/message.js", () => ({
+  messageCommand,
+}));
 vi.mock("../commands/status.js", () => ({ statusCommand }));
+vi.mock("../commands/configure.js", () => ({
+  CONFIGURE_WIZARD_SECTIONS: [
+    "workspace",
+    "model",
+    "gateway",
+    "daemon",
+    "providers",
+    "skills",
+    "health",
+  ],
+  configureCommand,
+  configureCommandWithSections,
+}));
+vi.mock("../commands/setup.js", () => ({ setupCommand }));
+vi.mock("../commands/onboard.js", () => ({ onboardCommand }));
 vi.mock("../runtime.js", () => ({ defaultRuntime: runtime }));
-vi.mock("../provider-web.js", () => ({
-  loginWeb,
+vi.mock("./provider-auth.js", () => ({
+  runProviderLogin,
+  runProviderLogout,
+}));
+vi.mock("../tui/tui.js", () => ({
+  runTui,
 }));
 vi.mock("../gateway/call.js", () => ({
   callGateway,
@@ -33,20 +60,177 @@ const { buildProgram } = await import("./program.js");
 describe("cli program", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    runTui.mockResolvedValue(undefined);
   });
 
-  it("runs send with required options", async () => {
+  it("runs message with required options", async () => {
     const program = buildProgram();
-    await program.parseAsync(["send", "--to", "+1", "--message", "hi"], {
-      from: "user",
-    });
-    expect(sendCommand).toHaveBeenCalled();
+    await program.parseAsync(
+      ["message", "send", "--to", "+1", "--message", "hi"],
+      {
+        from: "user",
+      },
+    );
+    expect(messageCommand).toHaveBeenCalled();
   });
 
   it("runs status command", async () => {
     const program = buildProgram();
     await program.parseAsync(["status"], { from: "user" });
     expect(statusCommand).toHaveBeenCalled();
+  });
+
+  it("runs tui without overriding timeout", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["tui"], { from: "user" });
+    expect(runTui).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: undefined }),
+    );
+  });
+
+  it("runs tui with explicit timeout override", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["tui", "--timeout-ms", "45000"], {
+      from: "user",
+    });
+    expect(runTui).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: 45000 }),
+    );
+  });
+
+  it("warns and ignores invalid tui timeout override", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["tui", "--timeout-ms", "nope"], {
+      from: "user",
+    });
+    expect(runtime.error).toHaveBeenCalledWith(
+      'warning: invalid --timeout-ms "nope"; ignoring',
+    );
+    expect(runTui).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: undefined }),
+    );
+  });
+
+  it("runs config alias as configure", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["config"], { from: "user" });
+    expect(configureCommand).toHaveBeenCalled();
+  });
+
+  it("runs setup without wizard flags", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["setup"], { from: "user" });
+    expect(setupCommand).toHaveBeenCalled();
+    expect(onboardCommand).not.toHaveBeenCalled();
+  });
+
+  it("runs setup wizard when wizard flags are present", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["setup", "--remote-url", "ws://example"], {
+      from: "user",
+    });
+    expect(onboardCommand).toHaveBeenCalled();
+    expect(setupCommand).not.toHaveBeenCalled();
+  });
+
+  it("passes opencode-zen api key to onboard", async () => {
+    const program = buildProgram();
+    await program.parseAsync(
+      [
+        "onboard",
+        "--non-interactive",
+        "--auth-choice",
+        "opencode-zen",
+        "--opencode-zen-api-key",
+        "sk-opencode-zen-test",
+      ],
+      { from: "user" },
+    );
+    expect(onboardCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nonInteractive: true,
+        authChoice: "opencode-zen",
+        opencodeZenApiKey: "sk-opencode-zen-test",
+      }),
+      runtime,
+    );
+  });
+
+  it("passes openrouter api key to onboard", async () => {
+    const program = buildProgram();
+    await program.parseAsync(
+      [
+        "onboard",
+        "--non-interactive",
+        "--auth-choice",
+        "openrouter-api-key",
+        "--openrouter-api-key",
+        "sk-openrouter-test",
+      ],
+      { from: "user" },
+    );
+    expect(onboardCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nonInteractive: true,
+        authChoice: "openrouter-api-key",
+        openrouterApiKey: "sk-openrouter-test",
+      }),
+      runtime,
+    );
+  });
+
+  it("passes zai api key to onboard", async () => {
+    const program = buildProgram();
+    await program.parseAsync(
+      [
+        "onboard",
+        "--non-interactive",
+        "--auth-choice",
+        "zai-api-key",
+        "--zai-api-key",
+        "sk-zai-test",
+      ],
+      { from: "user" },
+    );
+    expect(onboardCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nonInteractive: true,
+        authChoice: "zai-api-key",
+        zaiApiKey: "sk-zai-test",
+      }),
+      runtime,
+    );
+  });
+
+  it("runs providers login", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["providers", "login", "--account", "work"], {
+      from: "user",
+    });
+    expect(runProviderLogin).toHaveBeenCalledWith(
+      { provider: undefined, account: "work", verbose: false },
+      runtime,
+    );
+  });
+
+  it("runs providers logout", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["providers", "logout", "--account", "work"], {
+      from: "user",
+    });
+    expect(runProviderLogout).toHaveBeenCalledWith(
+      { provider: undefined, account: "work" },
+      runtime,
+    );
+  });
+
+  it("runs hidden login alias", async () => {
+    const program = buildProgram();
+    await program.parseAsync(["login", "--account", "work"], { from: "user" });
+    expect(runProviderLogin).toHaveBeenCalledWith(
+      { provider: undefined, account: "work", verbose: false },
+      runtime,
+    );
   });
 
   it("runs nodes list and calls node.pair.list", async () => {
@@ -381,7 +565,7 @@ describe("cli program", () => {
 
     const out = String(runtime.log.mock.calls[0]?.[0] ?? "");
     const mediaPath = out.replace(/^MEDIA:/, "").trim();
-    expect(mediaPath).toMatch(/clawdis-camera-clip-front-.*\.mp4$/);
+    expect(mediaPath).toMatch(/clawdbot-camera-clip-front-.*\.mp4$/);
 
     try {
       await expect(fs.readFile(mediaPath, "utf8")).resolves.toBe("hi");
@@ -425,6 +609,10 @@ describe("cli program", () => {
         "640",
         "--quality",
         "0.8",
+        "--delay-ms",
+        "2000",
+        "--device-id",
+        "cam-123",
       ],
       { from: "user" },
     );
@@ -442,6 +630,8 @@ describe("cli program", () => {
             facing: "front",
             maxWidth: 640,
             quality: 0.8,
+            delayMs: 2000,
+            deviceId: "cam-123",
           }),
         }),
       }),
@@ -494,6 +684,8 @@ describe("cli program", () => {
         "--duration",
         "3000",
         "--no-audio",
+        "--device-id",
+        "cam-123",
       ],
       { from: "user" },
     );
@@ -509,6 +701,7 @@ describe("cli program", () => {
           idempotencyKey: "idem-test",
           params: expect.objectContaining({
             includeAudio: false,
+            deviceId: "cam-123",
           }),
         }),
       }),
@@ -598,45 +791,7 @@ describe("cli program", () => {
 
     const out = String(runtime.log.mock.calls[0]?.[0] ?? "");
     const mediaPath = out.replace(/^MEDIA:/, "").trim();
-    expect(mediaPath).toMatch(/clawdis-canvas-snapshot-.*\.png$/);
-
-    try {
-      await expect(fs.readFile(mediaPath, "utf8")).resolves.toBe("hi");
-    } finally {
-      await fs.unlink(mediaPath).catch(() => {});
-    }
-  });
-
-  it("runs canvas snapshot and prints MEDIA path", async () => {
-    callGateway
-      .mockResolvedValueOnce({
-        ts: Date.now(),
-        nodes: [
-          {
-            nodeId: "mac-1",
-            displayName: "Mac Node",
-            platform: "macos",
-            connected: true,
-            caps: ["canvas"],
-          },
-        ],
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        nodeId: "mac-1",
-        command: "canvas.snapshot",
-        payload: { format: "png", base64: "aGk=" },
-      });
-
-    const program = buildProgram();
-    runtime.log.mockClear();
-    await program.parseAsync(["canvas", "snapshot", "--format", "png"], {
-      from: "user",
-    });
-
-    const out = String(runtime.log.mock.calls[0]?.[0] ?? "");
-    const mediaPath = out.replace(/^MEDIA:/, "").trim();
-    expect(mediaPath).toMatch(/clawdis-canvas-snapshot-.*\.png$/);
+    expect(mediaPath).toMatch(/clawdbot-canvas-snapshot-.*\.png$/);
 
     try {
       await expect(fs.readFile(mediaPath, "utf8")).resolves.toBe("hi");

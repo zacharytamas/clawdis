@@ -2,11 +2,16 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import WebSocket from "ws";
 
 import { ensurePortAvailable } from "../infra/ports.js";
 import { createSubsystemLogger } from "../logging.js";
 import { CONFIG_DIR } from "../utils.js";
-import type { ResolvedBrowserConfig } from "./config.js";
+import { normalizeCdpWsUrl } from "./cdp.js";
+import type {
+  ResolvedBrowserConfig,
+  ResolvedBrowserProfile,
+} from "./config.js";
 import {
   DEFAULT_CLAWD_BROWSER_COLOR,
   DEFAULT_CLAWD_BROWSER_PROFILE_NAME,
@@ -15,7 +20,7 @@ import {
 const log = createSubsystemLogger("browser").child("chrome");
 
 export type BrowserExecutable = {
-  kind: "canary" | "chromium" | "chrome";
+  kind: "canary" | "chromium" | "chrome" | "custom";
   path: string;
 };
 
@@ -34,6 +39,16 @@ function exists(filePath: string) {
   } catch {
     return false;
   }
+}
+
+function findFirstExecutable(
+  candidates: Array<BrowserExecutable>,
+): BrowserExecutable | null {
+  for (const candidate of candidates) {
+    if (exists(candidate.path)) return candidate;
+  }
+
+  return null;
 }
 
 export function findChromeExecutableMac(): BrowserExecutable | null {
@@ -73,20 +88,117 @@ export function findChromeExecutableMac(): BrowserExecutable | null {
     },
   ];
 
-  for (const candidate of candidates) {
-    if (exists(candidate.path)) return candidate;
+  return findFirstExecutable(candidates);
+}
+
+export function findChromeExecutableLinux(): BrowserExecutable | null {
+  const candidates: Array<BrowserExecutable> = [
+    { kind: "chrome", path: "/usr/bin/google-chrome" },
+    { kind: "chrome", path: "/usr/bin/google-chrome-stable" },
+    { kind: "chromium", path: "/usr/bin/chromium" },
+    { kind: "chromium", path: "/usr/bin/chromium-browser" },
+    { kind: "chromium", path: "/snap/bin/chromium" },
+    { kind: "chrome", path: "/usr/bin/chrome" },
+  ];
+
+  return findFirstExecutable(candidates);
+}
+
+export function findChromeExecutableWindows(): BrowserExecutable | null {
+  const localAppData = process.env.LOCALAPPDATA ?? "";
+  const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+  // Must use bracket notation: variable name contains parentheses
+  const programFilesX86 =
+    process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+
+  const joinWin = path.win32.join;
+  const candidates: Array<BrowserExecutable> = [];
+
+  if (localAppData) {
+    // Chrome Canary (user install)
+    candidates.push({
+      kind: "canary",
+      path: joinWin(
+        localAppData,
+        "Google",
+        "Chrome SxS",
+        "Application",
+        "chrome.exe",
+      ),
+    });
+    // Chromium (user install)
+    candidates.push({
+      kind: "chromium",
+      path: joinWin(localAppData, "Chromium", "Application", "chrome.exe"),
+    });
+    // Chrome (user install)
+    candidates.push({
+      kind: "chrome",
+      path: joinWin(
+        localAppData,
+        "Google",
+        "Chrome",
+        "Application",
+        "chrome.exe",
+      ),
+    });
   }
 
+  // Chrome (system install, 64-bit)
+  candidates.push({
+    kind: "chrome",
+    path: joinWin(
+      programFiles,
+      "Google",
+      "Chrome",
+      "Application",
+      "chrome.exe",
+    ),
+  });
+  // Chrome (system install, 32-bit on 64-bit Windows)
+  candidates.push({
+    kind: "chrome",
+    path: joinWin(
+      programFilesX86,
+      "Google",
+      "Chrome",
+      "Application",
+      "chrome.exe",
+    ),
+  });
+
+  return findFirstExecutable(candidates);
+}
+
+export function resolveBrowserExecutableForPlatform(
+  resolved: ResolvedBrowserConfig,
+  platform: NodeJS.Platform,
+): BrowserExecutable | null {
+  if (resolved.executablePath) {
+    if (!exists(resolved.executablePath)) {
+      throw new Error(
+        `browser.executablePath not found: ${resolved.executablePath}`,
+      );
+    }
+    return { kind: "custom", path: resolved.executablePath };
+  }
+
+  if (platform === "darwin") return findChromeExecutableMac();
+  if (platform === "linux") return findChromeExecutableLinux();
+  if (platform === "win32") return findChromeExecutableWindows();
   return null;
 }
 
-export function resolveClawdUserDataDir() {
-  return path.join(
-    CONFIG_DIR,
-    "browser",
-    DEFAULT_CLAWD_BROWSER_PROFILE_NAME,
-    "user-data",
-  );
+function resolveBrowserExecutable(
+  resolved: ResolvedBrowserConfig,
+): BrowserExecutable | null {
+  return resolveBrowserExecutableForPlatform(resolved, process.platform);
+}
+
+export function resolveClawdUserDataDir(
+  profileName = DEFAULT_CLAWD_BROWSER_PROFILE_NAME,
+) {
+  return path.join(CONFIG_DIR, "browser", profileName, "user-data");
 }
 
 function decoratedMarkerPath(userDataDir: string) {
@@ -109,6 +221,10 @@ function safeReadJson(filePath: string): Record<string, unknown> | null {
 function safeWriteJson(filePath: string, data: Record<string, unknown>) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+function cdpUrlForPort(cdpPort: number) {
+  return `http://127.0.0.1:${cdpPort}`;
 }
 
 function setDeep(obj: Record<string, unknown>, keys: string[], value: unknown) {
@@ -215,9 +331,9 @@ function isProfileDecorated(
  */
 export function decorateClawdProfile(
   userDataDir: string,
-  opts?: { color?: string },
+  opts?: { name?: string; color?: string },
 ) {
-  const desiredName = DEFAULT_CLAWD_BROWSER_PROFILE_NAME;
+  const desiredName = opts?.name ?? DEFAULT_CLAWD_BROWSER_PROFILE_NAME;
   const desiredColor = (
     opts?.color ?? DEFAULT_CLAWD_BROWSER_COLOR
   ).toUpperCase();
@@ -303,48 +419,125 @@ export function decorateClawdProfile(
 }
 
 export async function isChromeReachable(
-  cdpPort: number,
+  cdpUrl: string,
   timeoutMs = 500,
 ): Promise<boolean> {
+  const version = await fetchChromeVersion(cdpUrl, timeoutMs);
+  return Boolean(version);
+}
+
+type ChromeVersion = {
+  webSocketDebuggerUrl?: string;
+  Browser?: string;
+  "User-Agent"?: string;
+};
+
+async function fetchChromeVersion(
+  cdpUrl: string,
+  timeoutMs = 500,
+): Promise<ChromeVersion | null> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`http://127.0.0.1:${cdpPort}/json/version`, {
+    const base = cdpUrl.replace(/\/$/, "");
+    const res = await fetch(`${base}/json/version`, {
       signal: ctrl.signal,
     });
-    return res.ok;
+    if (!res.ok) return null;
+    const data = (await res.json()) as ChromeVersion;
+    if (!data || typeof data !== "object") return null;
+    return data;
   } catch {
-    return false;
+    return null;
   } finally {
     clearTimeout(t);
   }
 }
 
+export async function getChromeWebSocketUrl(
+  cdpUrl: string,
+  timeoutMs = 500,
+): Promise<string | null> {
+  const version = await fetchChromeVersion(cdpUrl, timeoutMs);
+  const wsUrl = String(version?.webSocketDebuggerUrl ?? "").trim();
+  if (!wsUrl) return null;
+  return normalizeCdpWsUrl(wsUrl, cdpUrl);
+}
+
+async function canOpenWebSocket(
+  wsUrl: string,
+  timeoutMs = 800,
+): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const ws = new WebSocket(wsUrl, { handshakeTimeout: timeoutMs });
+    const timer = setTimeout(
+      () => {
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+        resolve(false);
+      },
+      Math.max(50, timeoutMs + 25),
+    );
+    ws.once("open", () => {
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      resolve(true);
+    });
+    ws.once("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+export async function isChromeCdpReady(
+  cdpUrl: string,
+  timeoutMs = 500,
+  handshakeTimeoutMs = 800,
+): Promise<boolean> {
+  const wsUrl = await getChromeWebSocketUrl(cdpUrl, timeoutMs);
+  if (!wsUrl) return false;
+  return await canOpenWebSocket(wsUrl, handshakeTimeoutMs);
+}
+
 export async function launchClawdChrome(
   resolved: ResolvedBrowserConfig,
+  profile: ResolvedBrowserProfile,
 ): Promise<RunningChrome> {
-  await ensurePortAvailable(resolved.cdpPort);
+  if (!profile.cdpIsLoopback) {
+    throw new Error(
+      `Profile "${profile.name}" is remote; cannot launch local Chrome.`,
+    );
+  }
+  await ensurePortAvailable(profile.cdpPort);
 
-  const exe = process.platform === "darwin" ? findChromeExecutableMac() : null;
+  const exe = resolveBrowserExecutable(resolved);
   if (!exe) {
     throw new Error(
-      "No supported browser found (Chrome Canary/Chromium/Chrome on macOS).",
+      "No supported browser found (Chrome/Chromium on macOS, Linux, or Windows).",
     );
   }
 
-  const userDataDir = resolveClawdUserDataDir();
+  const userDataDir = resolveClawdUserDataDir(profile.name);
   fs.mkdirSync(userDataDir, { recursive: true });
 
   const needsDecorate = !isProfileDecorated(
     userDataDir,
-    DEFAULT_CLAWD_BROWSER_PROFILE_NAME,
-    (resolved.color ?? DEFAULT_CLAWD_BROWSER_COLOR).toUpperCase(),
+    profile.name,
+    (profile.color ?? DEFAULT_CLAWD_BROWSER_COLOR).toUpperCase(),
   );
 
   // First launch to create preference files if missing, then decorate and relaunch.
   const spawnOnce = () => {
     const args: string[] = [
-      `--remote-debugging-port=${resolved.cdpPort}`,
+      `--remote-debugging-port=${profile.cdpPort}`,
       `--user-data-dir=${userDataDir}`,
       "--no-first-run",
       "--no-default-browser-check",
@@ -359,6 +552,13 @@ export async function launchClawdChrome(
       // Best-effort; older Chromes may ignore.
       args.push("--headless=new");
       args.push("--disable-gpu");
+    }
+    if (resolved.noSandbox) {
+      args.push("--no-sandbox");
+      args.push("--disable-setuid-sandbox");
+    }
+    if (process.platform === "linux") {
+      args.push("--disable-dev-shm-usage");
     }
 
     // Always open a blank tab to ensure a target exists.
@@ -403,8 +603,11 @@ export async function launchClawdChrome(
 
   if (needsDecorate) {
     try {
-      decorateClawdProfile(userDataDir, { color: resolved.color });
-      log.info(`🦞 clawd browser profile decorated (${resolved.color})`);
+      decorateClawdProfile(userDataDir, {
+        name: profile.name,
+        color: profile.color,
+      });
+      log.info(`🦞 clawd browser profile decorated (${profile.color})`);
     } catch (err) {
       log.warn(`clawd browser profile decoration failed: ${String(err)}`);
     }
@@ -414,29 +617,31 @@ export async function launchClawdChrome(
   // Wait for CDP to come up.
   const readyDeadline = Date.now() + 15_000;
   while (Date.now() < readyDeadline) {
-    if (await isChromeReachable(resolved.cdpPort, 500)) break;
+    if (await isChromeReachable(profile.cdpUrl, 500)) break;
     await new Promise((r) => setTimeout(r, 200));
   }
 
-  if (!(await isChromeReachable(resolved.cdpPort, 500))) {
+  if (!(await isChromeReachable(profile.cdpUrl, 500))) {
     try {
       proc.kill("SIGKILL");
     } catch {
       // ignore
     }
-    throw new Error(`Failed to start Chrome CDP on port ${resolved.cdpPort}.`);
+    throw new Error(
+      `Failed to start Chrome CDP on port ${profile.cdpPort} for profile "${profile.name}".`,
+    );
   }
 
   const pid = proc.pid ?? -1;
   log.info(
-    `🦞 clawd browser started (${exe.kind}) on 127.0.0.1:${resolved.cdpPort} (pid ${pid})`,
+    `🦞 clawd browser started (${exe.kind}) profile "${profile.name}" on 127.0.0.1:${profile.cdpPort} (pid ${pid})`,
   );
 
   return {
     pid,
     exe,
     userDataDir,
-    cdpPort: resolved.cdpPort,
+    cdpPort: profile.cdpPort,
     startedAt,
     proc,
   };
@@ -457,7 +662,7 @@ export async function stopClawdChrome(
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (!proc.exitCode && proc.killed) break;
-    if (!(await isChromeReachable(running.cdpPort, 200))) return;
+    if (!(await isChromeReachable(cdpUrlForPort(running.cdpPort), 200))) return;
     await new Promise((r) => setTimeout(r, 100));
   }
 

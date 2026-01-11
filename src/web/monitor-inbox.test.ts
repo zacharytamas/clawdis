@@ -10,18 +10,33 @@ vi.mock("../media/store.js", () => ({
 }));
 
 const mockLoadConfig = vi.fn().mockReturnValue({
-  routing: {
+  whatsapp: {
     allowFrom: ["*"], // Allow all in tests by default
   },
   messages: {
     messagePrefix: undefined,
     responsePrefix: undefined,
-    timestampPrefix: false,
   },
 });
 
-vi.mock("../config/config.js", () => ({
-  loadConfig: () => mockLoadConfig(),
+const readAllowFromStoreMock = vi.fn().mockResolvedValue([]);
+const upsertPairingRequestMock = vi
+  .fn()
+  .mockResolvedValue({ code: "PAIRCODE", created: true });
+
+vi.mock("../config/config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/config.js")>();
+  return {
+    ...actual,
+    loadConfig: () => mockLoadConfig(),
+  };
+});
+
+vi.mock("../pairing/pairing-store.js", () => ({
+  readProviderAllowFromStore: (...args: unknown[]) =>
+    readAllowFromStoreMock(...args),
+  upsertProviderPairingRequest: (...args: unknown[]) =>
+    upsertPairingRequestMock(...args),
 }));
 
 vi.mock("./session.js", () => {
@@ -35,6 +50,11 @@ vi.mock("./session.js", () => {
     readMessages: vi.fn().mockResolvedValue(undefined),
     updateMediaMessage: vi.fn(),
     logger: {},
+    signalRepository: {
+      lidMapping: {
+        getPNForLID: vi.fn().mockResolvedValue(null),
+      },
+    },
     user: { id: "123@s.whatsapp.net" },
   };
   return {
@@ -56,17 +76,28 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { resetLogger, setLoggerOverride } from "../logging.js";
-import { monitorWebInbox } from "./inbound.js";
+import { monitorWebInbox, resetWebInboundDedupe } from "./inbound.js";
+
+const ACCOUNT_ID = "default";
+let authDir: string;
 
 describe("web monitor inbox", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    readAllowFromStoreMock.mockResolvedValue([]);
+    upsertPairingRequestMock.mockResolvedValue({
+      code: "PAIRCODE",
+      created: true,
+    });
+    resetWebInboundDedupe();
+    authDir = fsSync.mkdtempSync(path.join(os.tmpdir(), "clawdbot-auth-"));
   });
 
   afterEach(() => {
     resetLogger();
     setLoggerOverride(null);
     vi.useRealTimers();
+    fsSync.rmSync(authDir, { recursive: true, force: true });
   });
 
   it("streams inbound messages", async () => {
@@ -75,7 +106,12 @@ describe("web monitor inbox", () => {
       await msg.reply("pong");
     });
 
-    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const listener = await monitorWebInbox({
+      verbose: false,
+      onMessage,
+      accountId: ACCOUNT_ID,
+      authDir,
+    });
     const sock = await createWaSocket();
     expect(sock.sendPresenceUpdate).toHaveBeenCalledWith("available");
     const upsert = {
@@ -116,6 +152,175 @@ describe("web monitor inbox", () => {
     await listener.close();
   });
 
+  it("deduplicates redelivered messages by id", async () => {
+    const onMessage = vi.fn(async () => {
+      return;
+    });
+
+    const listener = await monitorWebInbox({
+      verbose: false,
+      onMessage,
+      accountId: ACCOUNT_ID,
+      authDir,
+    });
+    const sock = await createWaSocket();
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: { id: "abc", fromMe: false, remoteJid: "999@s.whatsapp.net" },
+          message: { conversation: "ping" },
+          messageTimestamp: 1_700_000_000,
+          pushName: "Tester",
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+
+    await listener.close();
+  });
+
+  it("resolves LID JIDs using Baileys LID mapping store", async () => {
+    const onMessage = vi.fn(async () => {
+      return;
+    });
+
+    const listener = await monitorWebInbox({
+      verbose: false,
+      onMessage,
+      accountId: ACCOUNT_ID,
+      authDir,
+    });
+    const sock = await createWaSocket();
+    const getPNForLID = vi.spyOn(
+      sock.signalRepository.lidMapping,
+      "getPNForLID",
+    );
+    sock.signalRepository.lidMapping.getPNForLID.mockResolvedValueOnce(
+      "999:0@s.whatsapp.net",
+    );
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: { id: "abc", fromMe: false, remoteJid: "999@lid" },
+          message: { conversation: "ping" },
+          messageTimestamp: 1_700_000_000,
+          pushName: "Tester",
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(getPNForLID).toHaveBeenCalledWith("999@lid");
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ body: "ping", from: "+999", to: "+123" }),
+    );
+
+    await listener.close();
+  });
+
+  it("resolves LID JIDs via authDir mapping files", async () => {
+    const onMessage = vi.fn(async () => {
+      return;
+    });
+    fsSync.writeFileSync(
+      path.join(authDir, "lid-mapping-555_reverse.json"),
+      JSON.stringify("1555"),
+    );
+
+    const listener = await monitorWebInbox({
+      verbose: false,
+      onMessage,
+      accountId: ACCOUNT_ID,
+      authDir,
+    });
+    const sock = await createWaSocket();
+    const getPNForLID = vi.spyOn(
+      sock.signalRepository.lidMapping,
+      "getPNForLID",
+    );
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: { id: "abc", fromMe: false, remoteJid: "555@lid" },
+          message: { conversation: "ping" },
+          messageTimestamp: 1_700_000_000,
+          pushName: "Tester",
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ body: "ping", from: "+1555", to: "+123" }),
+    );
+    expect(getPNForLID).not.toHaveBeenCalled();
+
+    await listener.close();
+  });
+
+  it("resolves group participant LID JIDs via Baileys mapping", async () => {
+    const onMessage = vi.fn(async () => {
+      return;
+    });
+
+    const listener = await monitorWebInbox({
+      verbose: false,
+      onMessage,
+      accountId: ACCOUNT_ID,
+      authDir,
+    });
+    const sock = await createWaSocket();
+    const getPNForLID = vi.spyOn(
+      sock.signalRepository.lidMapping,
+      "getPNForLID",
+    );
+    sock.signalRepository.lidMapping.getPNForLID.mockResolvedValueOnce(
+      "444:0@s.whatsapp.net",
+    );
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "abc",
+            fromMe: false,
+            remoteJid: "123@g.us",
+            participant: "444@lid",
+          },
+          message: { conversation: "ping" },
+          messageTimestamp: 1_700_000_000,
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(getPNForLID).toHaveBeenCalledWith("444@lid");
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: "ping",
+        from: "123@g.us",
+        senderE164: "+444",
+        chatType: "group",
+      }),
+    );
+
+    await listener.close();
+  });
+
   it("does not block follow-up messages when handler is pending", async () => {
     let resolveFirst: (() => void) | null = null;
     const onMessage = vi.fn(async () => {
@@ -126,7 +331,12 @@ describe("web monitor inbox", () => {
       }
     });
 
-    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const listener = await monitorWebInbox({
+      verbose: false,
+      onMessage,
+      accountId: ACCOUNT_ID,
+      authDir,
+    });
     const sock = await createWaSocket();
     const upsert = {
       type: "notify",
@@ -282,6 +492,26 @@ describe("web monitor inbox", () => {
     await listener.close();
   });
 
+  it("sets gifPlayback on outbound video payloads when requested", async () => {
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+    const buf = Buffer.from("gifvid");
+
+    await listener.sendMessage("+1555", "gif", buf, "video/mp4", {
+      gifPlayback: true,
+    });
+
+    expect(sock.sendMessage).toHaveBeenCalledWith("1555@s.whatsapp.net", {
+      video: buf,
+      caption: "gif",
+      mimetype: "video/mp4",
+      gifPlayback: true,
+    });
+
+    await listener.close();
+  });
+
   it("resolves onClose when the socket closes", async () => {
     const listener = await monitorWebInbox({
       verbose: false,
@@ -302,7 +532,7 @@ describe("web monitor inbox", () => {
   it("logs inbound bodies to file", async () => {
     const logPath = path.join(
       os.tmpdir(),
-      `clawdis-log-test-${crypto.randomUUID()}.log`,
+      `clawdbot-log-test-${crypto.randomUUID()}.log`,
     );
     setLoggerOverride({ level: "trace", file: logPath });
 
@@ -450,13 +680,12 @@ describe("web monitor inbox", () => {
 
   it("still forwards group messages (with sender info) even when allowFrom is restrictive", async () => {
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         allowFrom: ["+111"], // does not include +777
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -506,13 +735,12 @@ describe("web monitor inbox", () => {
     // Test for auto-recovery fix: early allowFrom filtering prevents Bad MAC errors
     // from unauthorized senders corrupting sessions
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         allowFrom: ["+111"], // Only allow +111
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -543,16 +771,22 @@ describe("web monitor inbox", () => {
     expect(onMessage).not.toHaveBeenCalled();
     // Should NOT send read receipts for blocked senders (privacy + avoids Baileys Bad MAC churn).
     expect(sock.readMessages).not.toHaveBeenCalled();
+    expect(sock.sendMessage).toHaveBeenCalledTimes(1);
+    expect(sock.sendMessage).toHaveBeenCalledWith("999@s.whatsapp.net", {
+      text: expect.stringContaining("Your WhatsApp phone number: +999"),
+    });
+    expect(sock.sendMessage).toHaveBeenCalledWith("999@s.whatsapp.net", {
+      text: expect.stringContaining("Pairing code: PAIRCODE"),
+    });
 
     // Reset mock for other tests
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         allowFrom: ["*"],
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -561,14 +795,13 @@ describe("web monitor inbox", () => {
 
   it("skips read receipts in self-chat mode", async () => {
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         // Self-chat heuristic: allowFrom includes selfE164 (+123).
         allowFrom: ["+123"],
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -598,13 +831,12 @@ describe("web monitor inbox", () => {
 
     // Reset mock for other tests
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         allowFrom: ["*"],
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -613,13 +845,12 @@ describe("web monitor inbox", () => {
 
   it("lets group messages through even when sender not in allowFrom", async () => {
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         allowFrom: ["+1234"],
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -653,15 +884,222 @@ describe("web monitor inbox", () => {
     await listener.close();
   });
 
-  it("allows messages from senders in allowFrom list", async () => {
+  it("blocks all group messages when groupPolicy is 'disabled'", async () => {
     mockLoadConfig.mockReturnValue({
-      routing: {
-        allowFrom: ["+111", "+999"], // Allow +999
+      whatsapp: {
+        allowFrom: ["+1234"],
+        groupPolicy: "disabled",
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
         timestampPrefix: false,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp-disabled",
+            fromMe: false,
+            remoteJid: "11111@g.us",
+            participant: "999@s.whatsapp.net",
+          },
+          message: { conversation: "group message should be blocked" },
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Should NOT call onMessage because groupPolicy is disabled
+    expect(onMessage).not.toHaveBeenCalled();
+
+    await listener.close();
+  });
+
+  it("blocks group messages from senders not in groupAllowFrom when groupPolicy is 'allowlist'", async () => {
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        groupAllowFrom: ["+1234"], // Does not include +999
+        groupPolicy: "allowlist",
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+        timestampPrefix: false,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp-allowlist-blocked",
+            fromMe: false,
+            remoteJid: "11111@g.us",
+            participant: "999@s.whatsapp.net",
+          },
+          message: { conversation: "unauthorized group sender" },
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Should NOT call onMessage because sender +999 not in groupAllowFrom
+    expect(onMessage).not.toHaveBeenCalled();
+
+    await listener.close();
+  });
+
+  it("allows group messages from senders in groupAllowFrom when groupPolicy is 'allowlist'", async () => {
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        groupAllowFrom: ["+15551234567"], // Includes the sender
+        groupPolicy: "allowlist",
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+        timestampPrefix: false,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp-allowlist-allowed",
+            fromMe: false,
+            remoteJid: "11111@g.us",
+            participant: "15551234567@s.whatsapp.net",
+          },
+          message: { conversation: "authorized group sender" },
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Should call onMessage because sender is in groupAllowFrom
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    const payload = onMessage.mock.calls[0][0];
+    expect(payload.chatType).toBe("group");
+    expect(payload.senderE164).toBe("+15551234567");
+
+    await listener.close();
+  });
+
+  it("allows all group senders with wildcard in groupPolicy allowlist", async () => {
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        groupAllowFrom: ["*"], // Wildcard allows everyone
+        groupPolicy: "allowlist",
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+        timestampPrefix: false,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp-wildcard-test",
+            fromMe: false,
+            remoteJid: "22222@g.us",
+            participant: "9999999999@s.whatsapp.net", // Random sender
+          },
+          message: { conversation: "wildcard group sender" },
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Should call onMessage because wildcard allows all senders
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    const payload = onMessage.mock.calls[0][0];
+    expect(payload.chatType).toBe("group");
+
+    await listener.close();
+  });
+
+  it("blocks group messages when groupPolicy allowlist has no groupAllowFrom", async () => {
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        groupPolicy: "allowlist",
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+        timestampPrefix: false,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp-allowlist-empty",
+            fromMe: false,
+            remoteJid: "11111@g.us",
+            participant: "999@s.whatsapp.net",
+          },
+          message: { conversation: "blocked by empty allowlist" },
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).not.toHaveBeenCalled();
+
+    await listener.close();
+  });
+
+  it("allows messages from senders in allowFrom list", async () => {
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        allowFrom: ["+111", "+999"], // Allow +999
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
       },
     });
 
@@ -685,18 +1123,21 @@ describe("web monitor inbox", () => {
 
     // Should call onMessage for authorized senders
     expect(onMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ body: "authorized message", from: "+999" }),
+      expect.objectContaining({
+        body: "authorized message",
+        from: "+999",
+        senderE164: "+999",
+      }),
     );
 
     // Reset mock for other tests
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         allowFrom: ["*"],
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -707,13 +1148,12 @@ describe("web monitor inbox", () => {
     // Same-phone mode: when from === selfJid, should always be allowed
     // This allows users to message themselves even with restrictive allowFrom
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         allowFrom: ["+111"], // Only allow +111, but self is +123
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
@@ -743,82 +1183,289 @@ describe("web monitor inbox", () => {
 
     // Reset mock for other tests
     mockLoadConfig.mockReturnValue({
-      routing: {
+      whatsapp: {
         allowFrom: ["*"],
       },
       messages: {
         messagePrefix: undefined,
         responsePrefix: undefined,
-        timestampPrefix: false,
       },
     });
 
     await listener.close();
   });
-});
-it("defaults to self-only when no config is present", async () => {
-  // No config file => allowFrom should be derived from selfE164
-  mockLoadConfig.mockReturnValue({});
 
-  const onMessage = vi.fn();
-  const listener = await monitorWebInbox({ verbose: false, onMessage });
-  const sock = await createWaSocket();
+  it("locks down when no config is present (pairing for unknown senders)", async () => {
+    // No config file => locked-down defaults apply (pairing for unknown senders)
+    mockLoadConfig.mockReturnValue({});
+    upsertPairingRequestMock
+      .mockResolvedValueOnce({ code: "PAIRCODE", created: true })
+      .mockResolvedValueOnce({ code: "PAIRCODE", created: false });
 
-  // Message from someone else should be blocked
-  const upsertBlocked = {
-    type: "notify",
-    messages: [
-      {
-        key: {
-          id: "no-config-1",
-          fromMe: false,
-          remoteJid: "999@s.whatsapp.net",
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    // Message from someone else should be blocked
+    const upsertBlocked = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "no-config-1",
+            fromMe: false,
+            remoteJid: "999@s.whatsapp.net",
+          },
+          message: { conversation: "ping" },
+          messageTimestamp: 1_700_000_000,
         },
-        message: { conversation: "ping" },
-        messageTimestamp: 1_700_000_000,
-      },
-    ],
-  };
+      ],
+    };
 
-  sock.ev.emit("messages.upsert", upsertBlocked);
-  await new Promise((resolve) => setImmediate(resolve));
-  expect(onMessage).not.toHaveBeenCalled();
+    sock.ev.emit("messages.upsert", upsertBlocked);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(sock.sendMessage).toHaveBeenCalledTimes(1);
+    expect(sock.sendMessage).toHaveBeenCalledWith("999@s.whatsapp.net", {
+      text: expect.stringContaining("Your WhatsApp phone number: +999"),
+    });
+    expect(sock.sendMessage).toHaveBeenCalledWith("999@s.whatsapp.net", {
+      text: expect.stringContaining("Pairing code: PAIRCODE"),
+    });
 
-  // Message from self should be allowed
-  const upsertSelf = {
-    type: "notify",
-    messages: [
-      {
-        key: {
-          id: "no-config-2",
-          fromMe: false,
-          remoteJid: "123@s.whatsapp.net",
+    const upsertBlockedAgain = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "no-config-1b",
+            fromMe: false,
+            remoteJid: "999@s.whatsapp.net",
+          },
+          message: { conversation: "ping again" },
+          messageTimestamp: 1_700_000_002,
         },
-        message: { conversation: "self ping" },
-        messageTimestamp: 1_700_000_001,
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsertBlockedAgain);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(sock.sendMessage).toHaveBeenCalledTimes(1);
+
+    // Message from self should be allowed
+    const upsertSelf = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "no-config-2",
+            fromMe: false,
+            remoteJid: "123@s.whatsapp.net",
+          },
+          message: { conversation: "self ping" },
+          messageTimestamp: 1_700_000_001,
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsertSelf);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: "self ping",
+        from: "+123",
+        to: "+123",
+      }),
+    );
+
+    // Reset mock for other tests
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        allowFrom: ["*"],
       },
-    ],
-  };
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+      },
+    });
 
-  sock.ev.emit("messages.upsert", upsertSelf);
-  await new Promise((resolve) => setImmediate(resolve));
-
-  expect(onMessage).toHaveBeenCalledTimes(1);
-  expect(onMessage).toHaveBeenCalledWith(
-    expect.objectContaining({ body: "self ping", from: "+123", to: "+123" }),
-  );
-
-  // Reset mock for other tests
-  mockLoadConfig.mockReturnValue({
-    routing: {
-      allowFrom: ["*"],
-    },
-    messages: {
-      messagePrefix: undefined,
-      responsePrefix: undefined,
-      timestampPrefix: false,
-    },
+    await listener.close();
   });
 
-  await listener.close();
+  it("skips pairing replies for outbound DMs in same-phone mode", async () => {
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        dmPolicy: "pairing",
+        selfChatMode: true,
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "fromme-1",
+            fromMe: true,
+            remoteJid: "999@s.whatsapp.net",
+          },
+          message: { conversation: "hello" },
+          messageTimestamp: 1_700_000_000,
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(upsertPairingRequestMock).not.toHaveBeenCalled();
+    expect(sock.sendMessage).not.toHaveBeenCalled();
+
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        allowFrom: ["*"],
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+      },
+    });
+
+    await listener.close();
+  });
+
+  it("skips pairing replies for outbound DMs when same-phone mode is disabled", async () => {
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        dmPolicy: "pairing",
+        selfChatMode: false,
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "fromme-2",
+            fromMe: true,
+            remoteJid: "999@s.whatsapp.net",
+          },
+          message: { conversation: "hello again" },
+          messageTimestamp: 1_700_000_000,
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(upsertPairingRequestMock).not.toHaveBeenCalled();
+    expect(sock.sendMessage).not.toHaveBeenCalled();
+
+    mockLoadConfig.mockReturnValue({
+      whatsapp: {
+        allowFrom: ["*"],
+      },
+      messages: {
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+      },
+    });
+
+    await listener.close();
+  });
+
+  it("handles append messages by marking them read but skipping auto-reply", async () => {
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "append",
+      messages: [
+        {
+          key: {
+            id: "history1",
+            fromMe: false,
+            remoteJid: "999@s.whatsapp.net",
+          },
+          message: { conversation: "old message" },
+          messageTimestamp: 1_700_000_000,
+          pushName: "History Sender",
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Verify it WAS marked as read
+    expect(sock.readMessages).toHaveBeenCalledWith([
+      {
+        remoteJid: "999@s.whatsapp.net",
+        id: "history1",
+        participant: undefined,
+        fromMe: false,
+      },
+    ]);
+
+    // Verify it WAS NOT passed to onMessage
+    expect(onMessage).not.toHaveBeenCalled();
+
+    await listener.close();
+  });
+
+  it("normalizes participant phone numbers to JIDs in sendReaction", async () => {
+    const listener = await monitorWebInbox({
+      verbose: false,
+      onMessage: vi.fn(),
+      accountId: ACCOUNT_ID,
+      authDir,
+    });
+    const sock = await createWaSocket();
+
+    await listener.sendReaction(
+      "12345@g.us",
+      "msg123",
+      "👍",
+      false,
+      "+6421000000",
+    );
+
+    expect(sock.sendMessage).toHaveBeenCalledWith("12345@g.us", {
+      react: {
+        text: "👍",
+        key: {
+          remoteJid: "12345@g.us",
+          id: "msg123",
+          fromMe: false,
+          participant: "6421000000@s.whatsapp.net",
+        },
+      },
+    });
+
+    await listener.close();
+  });
 });

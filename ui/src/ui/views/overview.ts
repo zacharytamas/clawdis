@@ -19,6 +19,7 @@ export type OverviewProps = {
   onSettingsChange: (next: UiSettings) => void;
   onPasswordChange: (next: string) => void;
   onSessionKeyChange: (next: string) => void;
+  onConnect: () => void;
   onRefresh: () => void;
 };
 
@@ -56,7 +57,7 @@ export function renderOverview(props: OverviewProps) {
                 const v = (e.target as HTMLInputElement).value;
                 props.onSettingsChange({ ...props.settings, token: v });
               }}
-              placeholder="CLAWDIS_GATEWAY_TOKEN"
+              placeholder="CLAWDBOT_GATEWAY_TOKEN"
             />
           </label>
           <label class="field">
@@ -83,8 +84,9 @@ export function renderOverview(props: OverviewProps) {
           </label>
         </div>
         <div class="row" style="margin-top: 14px;">
+          <button class="btn" @click=${() => props.onConnect()}>Connect</button>
           <button class="btn" @click=${() => props.onRefresh()}>Refresh</button>
-          <span class="muted">Reconnect to apply changes.</span>
+          <span class="muted">Click Connect to apply connection changes.</span>
         </div>
       </div>
 
@@ -120,7 +122,7 @@ export function renderOverview(props: OverviewProps) {
               ${props.lastError}
             </div>`
           : html`<div class="callout" style="margin-top: 14px;">
-              Use Connections to link WhatsApp and Telegram.
+              Use Connections to link WhatsApp, Telegram, Discord, Signal, or iMessage.
             </div>`}
       </div>
     </section>

@@ -8,7 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   decorateClawdProfile,
   findChromeExecutableMac,
+  findChromeExecutableWindows,
   isChromeReachable,
+  resolveBrowserExecutableForPlatform,
   stopClawdChrome,
 } from "./chrome.js";
 import {
@@ -29,7 +31,7 @@ describe("browser chrome profile decoration", () => {
 
   it("writes expected name + signed ARGB seed to Chrome prefs", async () => {
     const userDataDir = await fsp.mkdtemp(
-      path.join(os.tmpdir(), "clawdis-chrome-test-"),
+      path.join(os.tmpdir(), "clawdbot-chrome-test-"),
     );
     try {
       decorateClawdProfile(userDataDir, { color: DEFAULT_CLAWD_BROWSER_COLOR });
@@ -71,7 +73,7 @@ describe("browser chrome profile decoration", () => {
 
   it("best-effort writes name when color is invalid", async () => {
     const userDataDir = await fsp.mkdtemp(
-      path.join(os.tmpdir(), "clawdis-chrome-test-"),
+      path.join(os.tmpdir(), "clawdbot-chrome-test-"),
     );
     try {
       decorateClawdProfile(userDataDir, { color: "lobster-orange" });
@@ -89,7 +91,7 @@ describe("browser chrome profile decoration", () => {
 
   it("recovers from missing/invalid preference files", async () => {
     const userDataDir = await fsp.mkdtemp(
-      path.join(os.tmpdir(), "clawdis-chrome-test-"),
+      path.join(os.tmpdir(), "clawdbot-chrome-test-"),
     );
     try {
       await fsp.mkdir(path.join(userDataDir, "Default"), { recursive: true });
@@ -116,7 +118,7 @@ describe("browser chrome profile decoration", () => {
 
   it("is idempotent when rerun on an existing profile", async () => {
     const userDataDir = await fsp.mkdtemp(
-      path.join(os.tmpdir(), "clawdis-chrome-test-"),
+      path.join(os.tmpdir(), "clawdbot-chrome-test-"),
     );
     try {
       decorateClawdProfile(userDataDir, { color: DEFAULT_CLAWD_BROWSER_COLOR });
@@ -135,6 +137,7 @@ describe("browser chrome profile decoration", () => {
 
 describe("browser chrome helpers", () => {
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -155,21 +158,84 @@ describe("browser chrome helpers", () => {
     exists.mockRestore();
   });
 
+  it("picks the first existing Chrome candidate on Windows", () => {
+    vi.stubEnv("LOCALAPPDATA", "C:\\Users\\Test\\AppData\\Local");
+    const exists = vi
+      .spyOn(fs, "existsSync")
+      .mockImplementation((p) => String(p).includes("Chrome SxS"));
+    const exe = findChromeExecutableWindows();
+    expect(exe?.kind).toBe("canary");
+    expect(exe?.path).toMatch(/Chrome SxS/);
+    exists.mockRestore();
+  });
+
+  it("finds Chrome in Program Files on Windows", () => {
+    const marker = path.win32.join("Program Files", "Google", "Chrome");
+    const exists = vi
+      .spyOn(fs, "existsSync")
+      .mockImplementation((p) => String(p).includes(marker));
+    const exe = findChromeExecutableWindows();
+    expect(exe?.kind).toBe("chrome");
+    expect(exe?.path).toMatch(/chrome\.exe$/);
+    exists.mockRestore();
+  });
+
+  it("returns null when no Chrome candidate exists on Windows", () => {
+    const exists = vi.spyOn(fs, "existsSync").mockReturnValue(false);
+    expect(findChromeExecutableWindows()).toBeNull();
+    exists.mockRestore();
+  });
+
+  it("resolves Windows executables without LOCALAPPDATA", () => {
+    vi.stubEnv("LOCALAPPDATA", "");
+    vi.stubEnv("ProgramFiles", "C:\\Program Files");
+    vi.stubEnv("ProgramFiles(x86)", "C:\\Program Files (x86)");
+    const marker = path.win32.join(
+      "Program Files",
+      "Google",
+      "Chrome",
+      "Application",
+      "chrome.exe",
+    );
+    const exists = vi
+      .spyOn(fs, "existsSync")
+      .mockImplementation((p) => String(p).includes(marker));
+    const exe = resolveBrowserExecutableForPlatform(
+      {} as Parameters<typeof resolveBrowserExecutableForPlatform>[0],
+      "win32",
+    );
+    expect(exe?.kind).toBe("chrome");
+    expect(exe?.path).toMatch(/chrome\.exe$/);
+    exists.mockRestore();
+  });
+
   it("reports reachability based on /json/version", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue({ ok: true } as unknown as Response),
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ webSocketDebuggerUrl: "ws://127.0.0.1/devtools" }),
+      } as unknown as Response),
     );
-    await expect(isChromeReachable(12345, 50)).resolves.toBe(true);
+    await expect(isChromeReachable("http://127.0.0.1:12345", 50)).resolves.toBe(
+      true,
+    );
 
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue({ ok: false } as unknown as Response),
+      vi.fn().mockResolvedValue({
+        ok: false,
+        json: async () => ({}),
+      } as unknown as Response),
     );
-    await expect(isChromeReachable(12345, 50)).resolves.toBe(false);
+    await expect(isChromeReachable("http://127.0.0.1:12345", 50)).resolves.toBe(
+      false,
+    );
 
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("boom")));
-    await expect(isChromeReachable(12345, 50)).resolves.toBe(false);
+    await expect(isChromeReachable("http://127.0.0.1:12345", 50)).resolves.toBe(
+      false,
+    );
   });
 
   it("stopClawdChrome no-ops when process is already killed", async () => {

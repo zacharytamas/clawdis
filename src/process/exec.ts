@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
-import { danger, isVerbose } from "../globals.js";
+import { danger, shouldLogVerbose } from "../globals.js";
 import { logDebug, logError } from "../logger.js";
 
 const execFileAsync = promisify(execFile);
@@ -22,13 +22,13 @@ export async function runExec(
         };
   try {
     const { stdout, stderr } = await execFileAsync(command, args, options);
-    if (isVerbose()) {
+    if (shouldLogVerbose()) {
       if (stdout.trim()) logDebug(stdout.trim());
       if (stderr.trim()) logError(stderr.trim());
     }
     return { stdout, stderr };
   } catch (err) {
-    if (isVerbose()) {
+    if (shouldLogVerbose()) {
       logError(danger(`Command failed: ${command} ${args.join(" ")}`));
     }
     throw err;
@@ -47,6 +47,7 @@ export type CommandOptions = {
   timeoutMs: number;
   cwd?: string;
   input?: string;
+  env?: NodeJS.ProcessEnv;
 };
 
 export async function runCommandWithTimeout(
@@ -57,13 +58,15 @@ export async function runCommandWithTimeout(
     typeof optionsOrTimeout === "number"
       ? { timeoutMs: optionsOrTimeout }
       : optionsOrTimeout;
-  const { timeoutMs, cwd, input } = options;
+  const { timeoutMs, cwd, input, env } = options;
+  const hasInput = input !== undefined;
 
   // Spawn with inherited stdin (TTY) so tools like `pi` stay interactive when needed.
   return await new Promise((resolve, reject) => {
     const child = spawn(argv[0], argv.slice(1), {
-      stdio: [input ? "pipe" : "inherit", "pipe", "pipe"],
+      stdio: [hasInput ? "pipe" : "inherit", "pipe", "pipe"],
       cwd,
+      env: env ? { ...process.env, ...env } : process.env,
     });
     let stdout = "";
     let stderr = "";
@@ -72,8 +75,8 @@ export async function runCommandWithTimeout(
       child.kill("SIGKILL");
     }, timeoutMs);
 
-    if (input && child.stdin) {
-      child.stdin.write(input);
+    if (hasInput && child.stdin) {
+      child.stdin.write(input ?? "");
       child.stdin.end();
     }
 

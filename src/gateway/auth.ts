@@ -1,5 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
+import type {
+  GatewayAuthConfig,
+  GatewayTailscaleMode,
+} from "../config/config.js";
 export type ResolvedGatewayAuthMode = "none" | "token" | "password";
 
 export type ResolvedGatewayAuth = {
@@ -98,10 +102,33 @@ function isTailscaleProxyRequest(req?: IncomingMessage): boolean {
   );
 }
 
+export function resolveGatewayAuth(params: {
+  authConfig?: GatewayAuthConfig | null;
+  env?: NodeJS.ProcessEnv;
+  tailscaleMode?: GatewayTailscaleMode;
+}): ResolvedGatewayAuth {
+  const authConfig = params.authConfig ?? {};
+  const env = params.env ?? process.env;
+  const token = authConfig.token ?? env.CLAWDBOT_GATEWAY_TOKEN ?? undefined;
+  const password =
+    authConfig.password ?? env.CLAWDBOT_GATEWAY_PASSWORD ?? undefined;
+  const mode: ResolvedGatewayAuth["mode"] =
+    authConfig.mode ?? (password ? "password" : token ? "token" : "none");
+  const allowTailscale =
+    authConfig.allowTailscale ??
+    (params.tailscaleMode === "serve" && mode !== "password");
+  return {
+    mode,
+    token,
+    password,
+    allowTailscale,
+  };
+}
+
 export function assertGatewayAuthConfigured(auth: ResolvedGatewayAuth): void {
   if (auth.mode === "token" && !auth.token) {
     throw new Error(
-      "gateway auth mode is token, but CLAWDIS_GATEWAY_TOKEN is not set",
+      "gateway auth mode is token, but no token was configured (set gateway.auth.token or CLAWDBOT_GATEWAY_TOKEN)",
     );
   }
   if (auth.mode === "password" && !auth.password) {
@@ -123,10 +150,10 @@ export async function authorizeGatewayConnect(params: {
     if (auth.allowTailscale && !localDirect) {
       const tailscaleUser = getTailscaleUser(req);
       if (!tailscaleUser) {
-        return { ok: false, reason: "unauthorized" };
+        return { ok: false, reason: "tailscale_user_missing" };
       }
       if (!isTailscaleProxyRequest(req)) {
-        return { ok: false, reason: "unauthorized" };
+        return { ok: false, reason: "tailscale_proxy_missing" };
       }
       return {
         ok: true,
@@ -138,31 +165,45 @@ export async function authorizeGatewayConnect(params: {
   }
 
   if (auth.mode === "token") {
-    if (auth.token && connectAuth?.token === auth.token) {
-      return { ok: true, method: "token" };
+    if (!auth.token) {
+      return { ok: false, reason: "token_missing_config" };
     }
+    if (!connectAuth?.token) {
+      return { ok: false, reason: "token_missing" };
+    }
+    if (connectAuth.token !== auth.token) {
+      return { ok: false, reason: "token_mismatch" };
+    }
+    return { ok: true, method: "token" };
   }
 
   if (auth.mode === "password") {
     const password = connectAuth?.password;
-    if (!password || !auth.password) {
-      return { ok: false, reason: "unauthorized" };
+    if (!auth.password) {
+      return { ok: false, reason: "password_missing_config" };
+    }
+    if (!password) {
+      return { ok: false, reason: "password_missing" };
     }
     if (!safeEqual(password, auth.password)) {
-      return { ok: false, reason: "unauthorized" };
+      return { ok: false, reason: "password_mismatch" };
     }
     return { ok: true, method: "password" };
   }
 
   if (auth.allowTailscale) {
     const tailscaleUser = getTailscaleUser(req);
-    if (tailscaleUser && isTailscaleProxyRequest(req)) {
-      return {
-        ok: true,
-        method: "tailscale",
-        user: tailscaleUser.login,
-      };
+    if (!tailscaleUser) {
+      return { ok: false, reason: "tailscale_user_missing" };
     }
+    if (!isTailscaleProxyRequest(req)) {
+      return { ok: false, reason: "tailscale_proxy_missing" };
+    }
+    return {
+      ok: true,
+      method: "tailscale",
+      user: tailscaleUser.login,
+    };
   }
 
   return { ok: false, reason: "unauthorized" };

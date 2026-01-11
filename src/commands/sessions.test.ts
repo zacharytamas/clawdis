@@ -7,11 +7,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Disable colors for deterministic snapshots.
 process.env.FORCE_COLOR = "0";
 
-vi.mock("../config/config.js", () => ({
-  loadConfig: () => ({
-    agent: { model: "pi:opus", contextTokens: 32000 },
-  }),
-}));
+vi.mock("../config/config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/config.js")>();
+  return {
+    ...actual,
+    loadConfig: () => ({
+      agents: {
+        defaults: {
+          model: { primary: "pi:opus" },
+          models: { "pi:opus": {} },
+          contextTokens: 32000,
+        },
+      },
+    }),
+  };
+});
 
 import { sessionsCommand } from "./sessions.js";
 
@@ -77,7 +87,7 @@ describe("sessionsCommand", () => {
 
   it("shows placeholder rows when tokens are missing", async () => {
     const store = writeStore({
-      "group:demo": {
+      "discord:group:demo": {
         sessionId: "xyz",
         updatedAt: Date.now() - 5 * 60_000,
         thinkingLevel: "high",
@@ -89,7 +99,7 @@ describe("sessionsCommand", () => {
 
     fs.rmSync(store);
 
-    const row = logs.find((line) => line.includes("group:demo")) ?? "";
+    const row = logs.find((line) => line.includes("discord:group:demo")) ?? "";
     expect(row).toContain("-".padEnd(20));
     expect(row).toContain("think:high");
     expect(row).toContain("5m ago");

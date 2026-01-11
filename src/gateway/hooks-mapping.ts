@@ -2,10 +2,11 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
-  CONFIG_PATH_CLAWDIS,
+  CONFIG_PATH_CLAWDBOT,
   type HookMappingConfig,
   type HooksConfig,
 } from "../config/config.js";
+import type { HookMessageProvider } from "./hooks.js";
 
 export type HookMappingResolved = {
   id: string;
@@ -18,8 +19,9 @@ export type HookMappingResolved = {
   messageTemplate?: string;
   textTemplate?: string;
   deliver?: boolean;
-  channel?: "last" | "whatsapp" | "telegram" | "discord";
+  provider?: HookMessageProvider;
   to?: string;
+  model?: string;
   thinking?: string;
   timeoutSeconds?: number;
   transform?: HookMappingTransformResolved;
@@ -50,14 +52,16 @@ export type HookAction =
       wakeMode: "now" | "next-heartbeat";
       sessionKey?: string;
       deliver?: boolean;
-      channel?: "last" | "whatsapp" | "telegram" | "discord";
+      provider?: HookMessageProvider;
       to?: string;
+      model?: string;
       thinking?: string;
       timeoutSeconds?: number;
     };
 
 export type HookMappingResult =
   | { ok: true; action: HookAction }
+  | { ok: true; action: null; skipped: true }
   | { ok: false; error: string };
 
 const hookPresetMappings: Record<string, HookMappingConfig[]> = {
@@ -86,8 +90,9 @@ type HookTransformResult = Partial<{
   name: string;
   sessionKey: string;
   deliver: boolean;
-  channel: "last" | "whatsapp" | "telegram" | "discord";
+  provider: HookMessageProvider;
   to: string;
+  model: string;
   thinking: string;
   timeoutSeconds: number;
 }> | null;
@@ -101,14 +106,14 @@ export function resolveHookMappings(
 ): HookMappingResolved[] {
   const presets = hooks?.presets ?? [];
   const mappings: HookMappingConfig[] = [];
+  if (hooks?.mappings) mappings.push(...hooks.mappings);
   for (const preset of presets) {
     const presetMappings = hookPresetMappings[preset];
     if (presetMappings) mappings.push(...presetMappings);
   }
-  if (hooks?.mappings) mappings.push(...hooks.mappings);
   if (mappings.length === 0) return [];
 
-  const configDir = path.dirname(CONFIG_PATH_CLAWDIS);
+  const configDir = path.dirname(CONFIG_PATH_CLAWDBOT);
   const transformsDir = hooks?.transformsDir
     ? resolvePath(configDir, hooks.transformsDir)
     : configDir;
@@ -133,9 +138,12 @@ export async function applyHookMappings(
     if (mapping.transform) {
       const transform = await loadTransform(mapping.transform);
       override = await transform(ctx);
-      if (override === null) return null;
+      if (override === null) {
+        return { ok: true, action: null, skipped: true };
+      }
     }
 
+    if (!base.action) return { ok: true, action: null, skipped: true };
     const merged = mergeAction(base.action, override, mapping.action);
     if (!merged.ok) return merged;
     return merged;
@@ -171,8 +179,9 @@ function normalizeHookMapping(
     messageTemplate: mapping.messageTemplate,
     textTemplate: mapping.textTemplate,
     deliver: mapping.deliver,
-    channel: mapping.channel,
+    provider: mapping.provider,
     to: mapping.to,
+    model: mapping.model,
     thinking: mapping.thinking,
     timeoutSeconds: mapping.timeoutSeconds,
     transform,
@@ -216,8 +225,9 @@ function buildActionFromMapping(
       wakeMode: mapping.wakeMode ?? "now",
       sessionKey: renderOptional(mapping.sessionKey, ctx),
       deliver: mapping.deliver,
-      channel: mapping.channel,
+      provider: mapping.provider,
       to: renderOptional(mapping.to, ctx),
+      model: renderOptional(mapping.model, ctx),
       thinking: renderOptional(mapping.thinking, ctx),
       timeoutSeconds: mapping.timeoutSeconds,
     },
@@ -266,8 +276,9 @@ function mergeAction(
       typeof override.deliver === "boolean"
         ? override.deliver
         : baseAgent?.deliver,
-    channel: override.channel ?? baseAgent?.channel,
+    provider: override.provider ?? baseAgent?.provider,
     to: override.to ?? baseAgent?.to,
+    model: override.model ?? baseAgent?.model,
     thinking: override.thinking ?? baseAgent?.thinking,
     timeoutSeconds: override.timeoutSeconds ?? baseAgent?.timeoutSeconds,
   });

@@ -5,7 +5,7 @@ export const TAB_GROUPS = [
     tabs: ["overview", "connections", "instances", "sessions", "cron"],
   },
   { label: "Agent", tabs: ["skills", "nodes"] },
-  { label: "Settings", tabs: ["config", "debug"] },
+  { label: "Settings", tabs: ["config", "debug", "logs"] },
 ] as const;
 
 export type Tab =
@@ -18,7 +18,8 @@ export type Tab =
   | "nodes"
   | "chat"
   | "config"
-  | "debug";
+  | "debug"
+  | "logs";
 
 const TAB_PATHS: Record<Tab, string> = {
   overview: "/overview",
@@ -31,13 +32,14 @@ const TAB_PATHS: Record<Tab, string> = {
   chat: "/chat",
   config: "/config",
   debug: "/debug",
+  logs: "/logs",
 };
 
 const PATH_TO_TAB = new Map(
   Object.entries(TAB_PATHS).map(([tab, path]) => [path, tab as Tab]),
 );
 
-function normalizeBasePath(basePath: string): string {
+export function normalizeBasePath(basePath: string): string {
   if (!basePath) return "";
   let base = basePath.trim();
   if (!base.startsWith("/")) base = `/${base}`;
@@ -78,6 +80,53 @@ export function tabFromPath(pathname: string, basePath = ""): Tab | null {
   return PATH_TO_TAB.get(normalized) ?? null;
 }
 
+export function inferBasePathFromPathname(pathname: string): string {
+  let normalized = normalizePath(pathname);
+  if (normalized.endsWith("/index.html")) {
+    normalized = normalizePath(normalized.slice(0, -"/index.html".length));
+  }
+  if (normalized === "/") return "";
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length === 0) return "";
+  for (let i = 0; i < segments.length; i++) {
+    const candidate = `/${segments.slice(i).join("/")}`.toLowerCase();
+    if (PATH_TO_TAB.has(candidate)) {
+      const prefix = segments.slice(0, i);
+      return prefix.length ? `/${prefix.join("/")}` : "";
+    }
+  }
+  return `/${segments.join("/")}`;
+}
+
+export function iconForTab(tab: Tab): string {
+  switch (tab) {
+    case "chat":
+      return "💬";
+    case "overview":
+      return "📊";
+    case "connections":
+      return "🔗";
+    case "instances":
+      return "📡";
+    case "sessions":
+      return "📄";
+    case "cron":
+      return "⏰";
+    case "skills":
+      return "⚡️";
+    case "nodes":
+      return "🖥️";
+    case "config":
+      return "⚙️";
+    case "debug":
+      return "🐞";
+    case "logs":
+      return "🧾";
+    default:
+      return "📁";
+  }
+}
+
 export function titleForTab(tab: Tab) {
   switch (tab) {
     case "overview":
@@ -100,6 +149,8 @@ export function titleForTab(tab: Tab) {
       return "Config";
     case "debug":
       return "Debug";
+    case "logs":
+      return "Logs";
     default:
       return "Control";
   }
@@ -124,9 +175,11 @@ export function subtitleForTab(tab: Tab) {
     case "chat":
       return "Direct gateway chat session for quick interventions.";
     case "config":
-      return "Edit ~/.clawdis/clawdis.json safely.";
+      return "Edit ~/.clawdbot/clawdbot.json safely.";
     case "debug":
       return "Gateway snapshots, events, and manual RPC calls.";
+    case "logs":
+      return "Live tail of the gateway file logs.";
     default:
       return "";
   }

@@ -13,20 +13,35 @@ import {
 } from "@whiskeysockets/baileys";
 
 import { loadConfig } from "../config/config.js";
-import { isVerbose, logVerbose } from "../globals.js";
+import { logVerbose, shouldLogVerbose } from "../globals.js";
+import { createDedupeCache } from "../infra/dedupe.js";
+import { recordProviderActivity } from "../infra/provider-activity.js";
 import { createSubsystemLogger, getChildLogger } from "../logging.js";
 import { saveMediaBuffer } from "../media/store.js";
+import { buildPairingReply } from "../pairing/pairing-messages.js";
+import {
+  readProviderAllowFromStore,
+  upsertProviderPairingRequest,
+} from "../pairing/pairing-store.js";
+import {
+  formatLocationText,
+  type NormalizedLocation,
+} from "../providers/location.js";
 import {
   isSelfChatMode,
   jidToE164,
   normalizeE164,
+  resolveJidToE164,
   toWhatsappJid,
 } from "../utils.js";
+import { resolveWhatsAppAccount } from "./accounts.js";
+import type { ActiveWebSendOptions } from "./active-listener.js";
 import {
   createWaSocket,
   getStatusCode,
   waitForWaConnection,
 } from "./session.js";
+import { parseVcard } from "./vcard.js";
 
 export type WebListenerCloseReason = {
   status?: number;
@@ -34,11 +49,23 @@ export type WebListenerCloseReason = {
   error?: unknown;
 };
 
+const RECENT_WEB_MESSAGE_TTL_MS = 20 * 60_000;
+const RECENT_WEB_MESSAGE_MAX = 5000;
+const recentInboundMessages = createDedupeCache({
+  ttlMs: RECENT_WEB_MESSAGE_TTL_MS,
+  maxSize: RECENT_WEB_MESSAGE_MAX,
+});
+
+export function resetWebInboundDedupe(): void {
+  recentInboundMessages.clear();
+}
+
 export type WebInboundMessage = {
   id?: string;
   from: string; // conversation id: E.164 for direct chats, group JID for groups
   conversationId: string; // alias for clarity (same as from)
   to: string;
+  accountId: string;
   body: string;
   pushName?: string;
   timestamp?: number;
@@ -55,6 +82,7 @@ export type WebInboundMessage = {
   mentionedJids?: string[];
   selfJid?: string | null;
   selfE164?: string | null;
+  location?: NormalizedLocation;
   sendComposing: () => Promise<void>;
   reply: (text: string) => Promise<void>;
   sendMedia: (payload: AnyMessageContent) => Promise<void>;
@@ -66,13 +94,18 @@ export type WebInboundMessage = {
 
 export async function monitorWebInbox(options: {
   verbose: boolean;
+  accountId: string;
+  authDir: string;
   onMessage: (msg: WebInboundMessage) => Promise<void>;
+  mediaMaxMb?: number;
 }) {
   const inboundLogger = getChildLogger({ module: "web-inbound" });
   const inboundConsoleLog = createSubsystemLogger(
     "gateway/providers/whatsapp",
   ).child("inbound");
-  const sock = await createWaSocket(false, options.verbose);
+  const sock = await createWaSocket(false, options.verbose, {
+    authDir: options.authDir,
+  });
   await waitForWaConnection(sock);
   let onCloseResolve: ((reason: WebListenerCloseReason) => void) | null = null;
   const onClose = new Promise<WebListenerCloseReason>((resolve) => {
@@ -87,7 +120,8 @@ export async function monitorWebInbox(options: {
   try {
     // Advertise that the gateway is online right after connecting.
     await sock.sendPresenceUpdate("available");
-    if (isVerbose()) logVerbose("Sent global 'available' presence on connect");
+    if (shouldLogVerbose())
+      logVerbose("Sent global 'available' presence on connect");
   } catch (err) {
     logVerbose(
       `Failed to send 'available' presence on connect: ${String(err)}`,
@@ -95,12 +129,17 @@ export async function monitorWebInbox(options: {
   }
   const selfJid = sock.user?.id;
   const selfE164 = selfJid ? jidToE164(selfJid) : null;
-  const seen = new Set<string>();
   const groupMetaCache = new Map<
     string,
     { subject?: string; participants?: string[]; expires: number }
   >();
   const GROUP_META_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  const lidLookup = sock.signalRepository?.lidMapping;
+
+  const resolveInboundJid = async (
+    jid: string | null | undefined,
+  ): Promise<string | null> =>
+    resolveJidToE164(jid, { authDir: options.authDir, lidLookup });
 
   const getGroupMeta = async (jid: string) => {
     const cached = groupMetaCache.get(jid);
@@ -108,9 +147,14 @@ export async function monitorWebInbox(options: {
     try {
       const meta = await sock.groupMetadata(jid);
       const participants =
-        meta.participants
-          ?.map((p) => jidToE164(p.id) ?? p.id)
-          .filter(Boolean) ?? [];
+        (
+          await Promise.all(
+            meta.participants?.map(async (p) => {
+              const mapped = await resolveInboundJid(p.id);
+              return mapped ?? p.id;
+            }) ?? [],
+          )
+        ).filter(Boolean) ?? [];
       const entry = {
         subject: meta.subject,
         participants,
@@ -128,12 +172,14 @@ export async function monitorWebInbox(options: {
     type?: string;
     messages?: Array<import("@whiskeysockets/baileys").WAMessage>;
   }) => {
-    if (upsert.type !== "notify") return;
+    if (upsert.type !== "notify" && upsert.type !== "append") return;
     for (const msg of upsert.messages ?? []) {
+      recordProviderActivity({
+        provider: "whatsapp",
+        accountId: options.accountId,
+        direction: "inbound",
+      });
       const id = msg.key?.id ?? undefined;
-      // De-dupe on message id; Baileys can emit retries.
-      if (id && seen.has(id)) continue;
-      if (id) seen.add(id);
       // Note: not filtering fromMe here - echo detection happens in auto-reply layer
       const remoteJid = msg.key?.remoteJid;
       if (!remoteJid) continue;
@@ -141,11 +187,19 @@ export async function monitorWebInbox(options: {
       if (remoteJid.endsWith("@status") || remoteJid.endsWith("@broadcast"))
         continue;
       const group = isJidGroup(remoteJid);
+      if (id) {
+        const dedupeKey = `${options.accountId}:${remoteJid}:${id}`;
+        if (recentInboundMessages.check(dedupeKey)) continue;
+      }
       const participantJid = msg.key?.participant ?? undefined;
-      const senderE164 = participantJid ? jidToE164(participantJid) : null;
-      const from = group ? remoteJid : jidToE164(remoteJid);
+      const from = group ? remoteJid : await resolveInboundJid(remoteJid);
       // Skip if we still can't resolve an id to key conversation
       if (!from) continue;
+      const senderE164 = group
+        ? participantJid
+          ? await resolveInboundJid(participantJid)
+          : null
+        : from;
       let groupSubject: string | undefined;
       let groupParticipants: string[] | undefined;
       if (group) {
@@ -157,29 +211,123 @@ export async function monitorWebInbox(options: {
       // Filter unauthorized senders early to prevent wasted processing
       // and potential session corruption from Bad MAC errors
       const cfg = loadConfig();
-      const configuredAllowFrom = cfg.routing?.allowFrom;
+      const account = resolveWhatsAppAccount({
+        cfg,
+        accountId: options.accountId,
+      });
+      const dmPolicy = cfg.whatsapp?.dmPolicy ?? "pairing";
+      const configuredAllowFrom = account.allowFrom;
+      const storeAllowFrom = await readProviderAllowFromStore("whatsapp").catch(
+        () => [],
+      );
       // Without user config, default to self-only DM access so the owner can talk to themselves
+      const combinedAllowFrom = Array.from(
+        new Set([...(configuredAllowFrom ?? []), ...storeAllowFrom]),
+      );
       const defaultAllowFrom =
-        (!configuredAllowFrom || configuredAllowFrom.length === 0) && selfE164
-          ? [selfE164]
-          : undefined;
+        combinedAllowFrom.length === 0 && selfE164 ? [selfE164] : undefined;
       const allowFrom =
-        configuredAllowFrom && configuredAllowFrom.length > 0
+        combinedAllowFrom.length > 0 ? combinedAllowFrom : defaultAllowFrom;
+      const groupAllowFrom =
+        account.groupAllowFrom ??
+        (configuredAllowFrom && configuredAllowFrom.length > 0
           ? configuredAllowFrom
-          : defaultAllowFrom;
+          : undefined);
       const isSamePhone = from === selfE164;
       const isSelfChat = isSelfChatMode(selfE164, configuredAllowFrom);
+      const isFromMe = Boolean(msg.key?.fromMe);
 
-      const allowlistEnabled =
-        !group && Array.isArray(allowFrom) && allowFrom.length > 0;
-      if (!isSamePhone && allowlistEnabled) {
-        const candidate = from;
-        const allowedList = allowFrom.map(normalizeE164);
-        if (!allowFrom.includes("*") && !allowedList.includes(candidate)) {
+      // Pre-compute normalized allowlists for filtering
+      const dmHasWildcard = allowFrom?.includes("*") ?? false;
+      const normalizedAllowFrom =
+        allowFrom && allowFrom.length > 0
+          ? allowFrom.filter((entry) => entry !== "*").map(normalizeE164)
+          : [];
+      const groupHasWildcard = groupAllowFrom?.includes("*") ?? false;
+      const normalizedGroupAllowFrom =
+        groupAllowFrom && groupAllowFrom.length > 0
+          ? groupAllowFrom.filter((entry) => entry !== "*").map(normalizeE164)
+          : [];
+
+      // Group policy filtering: controls how group messages are handled
+      // - "open" (default): groups bypass allowFrom, only mention-gating applies
+      // - "disabled": block all group messages entirely
+      // - "allowlist": only allow group messages from senders in groupAllowFrom/allowFrom
+      const groupPolicy = account.groupPolicy ?? "open";
+      if (group && groupPolicy === "disabled") {
+        logVerbose(`Blocked group message (groupPolicy: disabled)`);
+        continue;
+      }
+      if (group && groupPolicy === "allowlist") {
+        // For allowlist mode, the sender (participant) must be in allowFrom
+        // If we can't resolve the sender E164, block the message for safety
+        if (!groupAllowFrom || groupAllowFrom.length === 0) {
           logVerbose(
-            `Blocked unauthorized sender ${candidate} (not in allowFrom list)`,
+            "Blocked group message (groupPolicy: allowlist, no groupAllowFrom)",
           );
-          continue; // Skip processing entirely
+          continue;
+        }
+        const senderAllowed =
+          groupHasWildcard ||
+          (senderE164 != null && normalizedGroupAllowFrom.includes(senderE164));
+        if (!senderAllowed) {
+          logVerbose(
+            `Blocked group message from ${senderE164 ?? "unknown sender"} (groupPolicy: allowlist)`,
+          );
+          continue;
+        }
+      }
+
+      // DM access control (secure defaults): "pairing" (default) / "allowlist" / "open" / "disabled"
+      if (!group) {
+        if (isFromMe && !isSamePhone) {
+          logVerbose("Skipping outbound DM (fromMe); no pairing reply needed.");
+          continue;
+        }
+        if (dmPolicy === "disabled") {
+          logVerbose("Blocked dm (dmPolicy: disabled)");
+          continue;
+        }
+        if (dmPolicy !== "open" && !isSamePhone) {
+          const candidate = from;
+          const allowed =
+            dmHasWildcard ||
+            (normalizedAllowFrom.length > 0 &&
+              normalizedAllowFrom.includes(candidate));
+          if (!allowed) {
+            if (dmPolicy === "pairing") {
+              const { code, created } = await upsertProviderPairingRequest({
+                provider: "whatsapp",
+                id: candidate,
+                meta: {
+                  name: (msg.pushName ?? "").trim() || undefined,
+                },
+              });
+              if (created) {
+                logVerbose(
+                  `whatsapp pairing request sender=${candidate} name=${msg.pushName ?? "unknown"}`,
+                );
+                try {
+                  await sock.sendMessage(remoteJid, {
+                    text: buildPairingReply({
+                      provider: "whatsapp",
+                      idLine: `Your WhatsApp phone number: ${candidate}`,
+                      code,
+                    }),
+                  });
+                } catch (err) {
+                  logVerbose(
+                    `whatsapp pairing reply failed for ${candidate}: ${String(err)}`,
+                  );
+                }
+              }
+            } else {
+              logVerbose(
+                `Blocked unauthorized sender ${candidate} (dmPolicy=${dmPolicy})`,
+              );
+            }
+            continue;
+          }
         }
       }
 
@@ -189,7 +337,7 @@ export async function monitorWebInbox(options: {
           await sock.readMessages([
             { remoteJid, id, participant, fromMe: false },
           ]);
-          if (isVerbose()) {
+          if (shouldLogVerbose()) {
             const suffix = participant ? ` (participant ${participant})` : "";
             logVerbose(
               `Marked message ${id} as read for ${remoteJid}${suffix}`,
@@ -198,12 +346,21 @@ export async function monitorWebInbox(options: {
         } catch (err) {
           logVerbose(`Failed to mark message ${id} read: ${String(err)}`);
         }
-      } else if (id && isSelfChat && isVerbose()) {
+      } else if (id && isSelfChat && shouldLogVerbose()) {
         // Self-chat mode: never auto-send read receipts (blue ticks) on behalf of the owner.
         logVerbose(`Self-chat mode: skipping read receipt for ${id}`);
       }
 
+      // If this is history/offline catch-up, we marked it as read above,
+      // but we skip triggering the auto-reply logic to avoid spamming old context.
+      if (upsert.type === "append") continue;
+
+      const location = extractLocationData(msg.message ?? undefined);
+      const locationText = location ? formatLocationText(location) : undefined;
       let body = extractText(msg.message ?? undefined);
+      if (locationText) {
+        body = [body, locationText].filter(Boolean).join("\n").trim();
+      }
       if (!body) {
         body = extractMediaPlaceholder(msg.message ?? undefined);
         if (!body) continue;
@@ -216,9 +373,16 @@ export async function monitorWebInbox(options: {
       try {
         const inboundMedia = await downloadInboundMedia(msg, sock);
         if (inboundMedia) {
+          const maxMb =
+            typeof options.mediaMaxMb === "number" && options.mediaMaxMb > 0
+              ? options.mediaMaxMb
+              : 50;
+          const maxBytes = maxMb * 1024 * 1024;
           const saved = await saveMediaBuffer(
             inboundMedia.buffer,
             inboundMedia.mimetype,
+            "inbound",
+            maxBytes,
           );
           mediaPath = saved.path;
           mediaType = inboundMedia.mimetype;
@@ -265,6 +429,7 @@ export async function monitorWebInbox(options: {
             from,
             conversationId: from,
             to: selfE164 ?? "me",
+            accountId: account.accountId,
             body,
             pushName: senderName,
             timestamp,
@@ -281,6 +446,7 @@ export async function monitorWebInbox(options: {
             mentionedJids: mentionedJids ?? undefined,
             selfJid,
             selfE164,
+            location: location ?? undefined,
             sendComposing,
             reply,
             sendMedia,
@@ -379,6 +545,7 @@ export async function monitorWebInbox(options: {
       text: string,
       mediaBuffer?: Buffer,
       mediaType?: string,
+      sendOptions?: ActiveWebSendOptions,
     ): Promise<{ messageId: string }> => {
       const jid = toWhatsappJid(to);
       let payload: AnyMessageContent;
@@ -396,10 +563,12 @@ export async function monitorWebInbox(options: {
             mimetype: mediaType,
           };
         } else if (mediaType.startsWith("video/")) {
+          const gifPlayback = sendOptions?.gifPlayback;
           payload = {
             video: mediaBuffer,
             caption: text || undefined,
             mimetype: mediaType,
+            ...(gifPlayback ? { gifPlayback: true } : {}),
           };
         } else {
           payload = {
@@ -413,7 +582,60 @@ export async function monitorWebInbox(options: {
         payload = { text };
       }
       const result = await sock.sendMessage(jid, payload);
+      const accountId = sendOptions?.accountId ?? options.accountId;
+      recordProviderActivity({
+        provider: "whatsapp",
+        accountId,
+        direction: "outbound",
+      });
       return { messageId: result?.key?.id ?? "unknown" };
+    },
+    /**
+     * Send a poll message through this connection's socket.
+     * Used by IPC to create WhatsApp polls in groups or chats.
+     */
+    sendPoll: async (
+      to: string,
+      poll: { question: string; options: string[]; maxSelections?: number },
+    ): Promise<{ messageId: string }> => {
+      const jid = toWhatsappJid(to);
+      const result = await sock.sendMessage(jid, {
+        poll: {
+          name: poll.question,
+          values: poll.options,
+          selectableCount: poll.maxSelections ?? 1,
+        },
+      });
+      recordProviderActivity({
+        provider: "whatsapp",
+        accountId: options.accountId,
+        direction: "outbound",
+      });
+      return { messageId: result?.key?.id ?? "unknown" };
+    },
+    /**
+     * Send a reaction (emoji) to a specific message.
+     * Pass an empty string for emoji to remove the reaction.
+     */
+    sendReaction: async (
+      chatJid: string,
+      messageId: string,
+      emoji: string,
+      fromMe: boolean,
+      participant?: string,
+    ): Promise<void> => {
+      const jid = toWhatsappJid(chatJid);
+      await sock.sendMessage(jid, {
+        react: {
+          text: emoji,
+          key: {
+            remoteJid: jid,
+            id: messageId,
+            fromMe,
+            participant: participant ? toWhatsappJid(participant) : undefined,
+          },
+        },
+      });
     },
     /**
      * Send typing indicator ("composing") to a chat.
@@ -523,6 +745,12 @@ export function extractText(
       candidate.documentMessage?.caption;
     if (caption?.trim()) return caption.trim();
   }
+  const contactPlaceholder =
+    extractContactPlaceholder(message) ??
+    (extracted && extracted !== message
+      ? extractContactPlaceholder(extracted as proto.IMessage | undefined)
+      : undefined);
+  if (contactPlaceholder) return contactPlaceholder;
   return undefined;
 }
 
@@ -539,6 +767,145 @@ export function extractMediaPlaceholder(
   return undefined;
 }
 
+function extractContactPlaceholder(
+  rawMessage: proto.IMessage | undefined,
+): string | undefined {
+  const message = unwrapMessage(rawMessage);
+  if (!message) return undefined;
+  const contact = message.contactMessage ?? undefined;
+  if (contact) {
+    const { name, phones } = describeContact({
+      displayName: contact.displayName,
+      vcard: contact.vcard,
+    });
+    return formatContactPlaceholder(name, phones);
+  }
+  const contactsArray = message.contactsArrayMessage?.contacts ?? undefined;
+  if (!contactsArray || contactsArray.length === 0) return undefined;
+  const labels = contactsArray
+    .map((entry) =>
+      describeContact({ displayName: entry.displayName, vcard: entry.vcard }),
+    )
+    .map((entry) => formatContactLabel(entry.name, entry.phones))
+    .filter((value): value is string => Boolean(value));
+  return formatContactsPlaceholder(labels, contactsArray.length);
+}
+
+function describeContact(input: {
+  displayName?: string | null;
+  vcard?: string | null;
+}): { name?: string; phones: string[] } {
+  const displayName = (input.displayName ?? "").trim();
+  const parsed = parseVcard(input.vcard ?? undefined);
+  const name = displayName || parsed.name;
+  return { name, phones: parsed.phones };
+}
+
+function formatContactPlaceholder(name?: string, phones?: string[]): string {
+  const label = formatContactLabel(name, phones);
+  if (!label) return "<contact>";
+  return `<contact: ${label}>`;
+}
+
+function formatContactsPlaceholder(labels: string[], total: number): string {
+  const cleaned = labels.map((label) => label.trim()).filter(Boolean);
+  if (cleaned.length === 0) {
+    const suffix = total === 1 ? "contact" : "contacts";
+    return `<contacts: ${total} ${suffix}>`;
+  }
+  const remaining = Math.max(total - cleaned.length, 0);
+  const suffix = remaining > 0 ? ` +${remaining} more` : "";
+  return `<contacts: ${cleaned.join(", ")}${suffix}>`;
+}
+
+function formatContactLabel(
+  name?: string,
+  phones?: string[],
+): string | undefined {
+  const phoneLabel = formatPhoneList(phones);
+  const parts = [name, phoneLabel].filter((value): value is string =>
+    Boolean(value),
+  );
+  if (parts.length === 0) return undefined;
+  return parts.join(", ");
+}
+
+function formatPhoneList(phones?: string[]): string | undefined {
+  const cleaned = phones?.map((phone) => phone.trim()).filter(Boolean) ?? [];
+  if (cleaned.length === 0) return undefined;
+  const { shown, remaining } = summarizeList(cleaned, cleaned.length, 1);
+  const [primary] = shown;
+  if (!primary) return undefined;
+  if (remaining === 0) return primary;
+  return `${primary} (+${remaining} more)`;
+}
+
+function summarizeList(
+  values: string[],
+  total: number,
+  maxShown: number,
+): { shown: string[]; remaining: number } {
+  const shown = values.slice(0, maxShown);
+  const remaining = Math.max(total - shown.length, 0);
+  return { shown, remaining };
+}
+
+export function extractLocationData(
+  rawMessage: proto.IMessage | undefined,
+): NormalizedLocation | null {
+  const message = unwrapMessage(rawMessage);
+  if (!message) return null;
+
+  const live = message.liveLocationMessage ?? undefined;
+  if (live) {
+    const latitudeRaw = live.degreesLatitude;
+    const longitudeRaw = live.degreesLongitude;
+    if (latitudeRaw != null && longitudeRaw != null) {
+      const latitude = Number(latitudeRaw);
+      const longitude = Number(longitudeRaw);
+      if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+        return {
+          latitude,
+          longitude,
+          accuracy: live.accuracyInMeters ?? undefined,
+          caption: live.caption ?? undefined,
+          source: "live",
+          isLive: true,
+        };
+      }
+    }
+  }
+
+  const location = message.locationMessage ?? undefined;
+  if (location) {
+    const latitudeRaw = location.degreesLatitude;
+    const longitudeRaw = location.degreesLongitude;
+    if (latitudeRaw != null && longitudeRaw != null) {
+      const latitude = Number(latitudeRaw);
+      const longitude = Number(longitudeRaw);
+      if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+        const isLive = Boolean(location.isLive);
+        return {
+          latitude,
+          longitude,
+          accuracy: location.accuracyInMeters ?? undefined,
+          name: location.name ?? undefined,
+          address: location.address ?? undefined,
+          caption: location.comment ?? undefined,
+          source: isLive
+            ? "live"
+            : location.name || location.address
+              ? "place"
+              : "pin",
+          isLive,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 function describeReplyContext(rawMessage: proto.IMessage | undefined): {
   id?: string;
   body: string;
@@ -551,7 +918,14 @@ function describeReplyContext(rawMessage: proto.IMessage | undefined): {
     contextInfo?.quotedMessage as proto.IMessage | undefined,
   ) as proto.IMessage | undefined;
   if (!quoted) return null;
-  const body = extractText(quoted) ?? extractMediaPlaceholder(quoted);
+  const location = extractLocationData(quoted);
+  const locationText = location ? formatLocationText(location) : undefined;
+  const text = extractText(quoted);
+  let body: string | undefined = [text, locationText]
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  if (!body) body = extractMediaPlaceholder(quoted);
   if (!body) {
     const quotedType = quoted ? getContentType(quoted) : undefined;
     logVerbose(
