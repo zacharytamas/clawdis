@@ -13,6 +13,7 @@ import {
   SYNTHETIC_MODEL_CATALOG,
 } from "./synthetic-models.js";
 import { discoverVeniceModels, VENICE_BASE_URL } from "./venice-models.js";
+import { discoverOpencodeZenModels, OPENCODE_ZEN_API_BASE_URL } from "./opencode-zen-models.js";
 
 type ModelsConfig = NonNullable<OpenClawConfig["models"]>;
 export type ProviderConfig = NonNullable<ModelsConfig["providers"]>[string];
@@ -394,6 +395,16 @@ async function buildOllamaProvider(): Promise<ProviderConfig> {
   };
 }
 
+async function buildOpencodeZenProvider(apiKey: string): Promise<ProviderConfig> {
+  const models = await discoverOpencodeZenModels(apiKey);
+  return {
+    baseUrl: OPENCODE_ZEN_API_BASE_URL,
+    api: "openai-completions",
+    models,
+    apiKey,
+  };
+}
+
 export async function resolveImplicitProviders(params: {
   agentDir: string;
 }): Promise<ModelsConfig["providers"]> {
@@ -461,6 +472,14 @@ export async function resolveImplicitProviders(params: {
     providers.ollama = { ...(await buildOllamaProvider()), apiKey: ollamaKey };
   }
 
+  // OpenCode Zen provider - dynamically fetches models from API
+  const opencodeKey =
+    resolveEnvApiKeyVarName("opencode") ??
+    resolveApiKeyFromProfiles({ provider: "opencode", store: authStore });
+  if (opencodeKey) {
+    providers.opencode = await buildOpencodeZenProvider(opencodeKey);
+  }
+
   return providers;
 }
 
@@ -469,7 +488,9 @@ export async function resolveImplicitCopilotProvider(params: {
   env?: NodeJS.ProcessEnv;
 }): Promise<ProviderConfig | null> {
   const env = params.env ?? process.env;
-  const authStore = ensureAuthProfileStore(params.agentDir, { allowKeychainPrompt: false });
+  const authStore = ensureAuthProfileStore(params.agentDir, {
+    allowKeychainPrompt: false,
+  });
   const hasProfile = listProfilesForProvider(authStore, "github-copilot").length > 0;
   const envToken = env.COPILOT_GITHUB_TOKEN ?? env.GH_TOKEN ?? env.GITHUB_TOKEN;
   const githubToken = (envToken ?? "").trim();
